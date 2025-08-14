@@ -1,0 +1,22 @@
+name: ms1fm
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy>=1.26
+  - scipy
+  - pandas
+  - pyarrow
+  - matplotlib
+  - pytorch-lightning=2.4.*
+  - einops
+  - pydantic>=2
+  - hydra-core>=1.3
+  - pytest
+  - mypy
+  - black
+  - ruff
+  - pre-commit
+  - pip:
+      - depthcharge-ms
