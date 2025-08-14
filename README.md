@@ -1,1 +1,1 @@
-# lcms-foundation-model
+# LC-MS foundation model
