@@ -42,10 +42,9 @@ encoder = dc.encoders.PeakEncoder(
     learnable_wavelengths=False,
 )
 
-
 for scan in loader:
-    mz = scan["mz_array"].squeeze(0)
-    intensities = scan["intensity_array"].squeeze(0)
+    mz = scan["mz_array"]
+    intensities = scan["intensity_array"]
     peaks = torch.stack([mz, intensities], dim=-1)
     encoded = encoder(peaks)
     print("Encoded shape:", encoded.shape)
