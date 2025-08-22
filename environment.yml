@@ -11,6 +11,7 @@ dependencies:
   - pyarrow
   - matplotlib
   - pytorch-lightning=2.4.*
+  - tensorboard
   - einops
   - pydantic>=2
   - hydra-core>=1.3
