@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import pytorch_lightning as L
@@ -17,8 +18,12 @@ class MS1Encoder(L.LightningModule):
         bin_mz_min=0,
         bin_mz_max=2000,
         masked_peaks_fraction=0.3,
+        lr=5e-4,
+        warmup_iters=1000,
+        cosine_schedule_period_iters=32000,
     ):
         super().__init__()
+        self.save_hyperparameters()
 
         self.d_model = d_model
         self.nhead = nhead
@@ -155,3 +160,70 @@ class MS1Encoder(L.LightningModule):
         self.log("val_loss_I", loss_I.item())
         self.log("val_loss", loss.item())
         return loss
+
+    def configure_optimizers(
+        self,
+    ):
+        """TODO."""
+        optimizer = torch.optim.Adam(
+            self.parameters(), lr=self.hparams.lr, betas=(0.9, 0.98)
+        )
+        self.lr_scheduler = CosineWarmupScheduler(
+            optimizer,
+            self.hparams.warmup_iters,
+            self.hparams.cosine_schedule_period_iters,
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": self.lr_scheduler,
+                "interval": "step",
+                "frequency": 1,
+                "name": "cosine_warmup",
+            },
+        }
+
+    def optimizer_step(self, *args, **kwargs):
+        super().optimizer_step(*args, **kwargs)
+        self.log("lr", self.lr_scheduler.get_last_lr()[0])
+
+
+class CosineWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
+    """
+    Impelementation borrowed from https://github.com/Noble-Lab/casanovo.
+    Learning rate scheduler with linear warm-up followed by cosine
+    shaped decay.
+
+    Parameters
+    ----------
+    optimizer : torch.optim.Optimizer
+        Optimizer object.
+    warmup_iters : int
+        The number of iterations for the linear warm-up of the learning
+        rate.
+    cosine_schedule_period_iters : int
+        The number of iterations for the cosine half period of the
+        learning rate.
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        warmup_iters: int,
+        cosine_schedule_period_iters: int,
+    ):
+        self.warmup_iters = warmup_iters
+        self.cosine_schedule_period_iters = cosine_schedule_period_iters
+        super().__init__(optimizer)
+
+    def get_lr(self):
+        lr_factor = self.get_lr_factor(epoch=self.last_epoch)
+        return [base_lr * lr_factor for base_lr in self.base_lrs]
+
+    def get_lr_factor(self, epoch):
+        lr_factor = 0.5 * (
+            1 + np.cos(np.pi * epoch / self.cosine_schedule_period_iters)
+        )
+        if epoch <= self.warmup_iters:
+            lr_factor *= epoch / self.warmup_iters
+        return lr_factor
