@@ -5,7 +5,7 @@ import polars as pl
 import depthcharge as dc
 import pytorch_lightning as L
 from torch.utils.data import DataLoader
-from source.model import MS1Encoder
+from model import MS1Encoder
 
 # Path to the training data
 DATA_DIR = "../data"
