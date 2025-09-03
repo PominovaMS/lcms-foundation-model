@@ -2,25 +2,42 @@
 
 import argparse
 import os
+import yaml
 import polars as pl
-import depthcharge as dc
 import pytorch_lightning as L
+from depthcharge.data import SpectrumDataset, spectra_to_df
 from torch.utils.data import DataLoader
 from model import MS1Encoder
 
-# Training batch size
-BATCH_SIZE = 20
-# Directory to save model checkpoints and logs
-CHECKPOINT_PATH = "./train_checkpoints"
+
+def load_config(config_path):
+    """Load configuration from YAML file."""
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+    return config
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--data_dir", required=True, help="The path to the training data.")
+parser.add_argument(
+    "--config", default="../config.yaml", help="Path to configuration file"
+)
 args = parser.parse_args()
 
+# Load configuration
+config = load_config(args.config)
+
+# Extract configuration values
+BATCH_SIZE = config["data"]["batch_size"]
+CHECKPOINT_PATH = config["training"]["checkpoint_path"]
+
 # Load training data
-ms1_dfs = [
-    dc.data.spectra_to_df(
-        os.path.join(args.data_dir, mzml_file),
+train_data_dir = os.path.join(args.data_dir, "train_mzml")
+val_data_dir = os.path.join(args.data_dir, "val_mzml")
+
+dfs = [
+    spectra_to_df(
+        os.path.join(train_data_dir, mzml_file),
         metadata_df=None,
         ms_level=1,
         preprocessing_fn=None,
@@ -28,58 +45,64 @@ ms1_dfs = [
         custom_fields=None,
         progress=True,
     )
-    for mzml_file in os.listdir(args.data_dir)
+    for mzml_file in os.listdir(train_data_dir)
 ]
-ms1_df = pl.concat(ms1_dfs, how="vertical")
+train_df = pl.concat(dfs, how="vertical")
+
+dfs = [
+    spectra_to_df(
+        os.path.join(val_data_dir, mzml_file),
+        metadata_df=None,
+        ms_level=1,
+        preprocessing_fn=None,
+        valid_charge=None,
+        custom_fields=None,
+        progress=True,
+    )
+    for mzml_file in os.listdir(val_data_dir)
+]
+val_df = pl.concat(dfs, how="vertical")
 
 # Rescale Intensities in the dataframe to [0, 1].
-# (more logical would be to do it in the dataset,
-# but unclear how to implement it in LanceDataset)
-ms1_df = ms1_df.with_columns(
+train_df = train_df.with_columns(
+    pl.col("intensity_array") / pl.col("intensity_array").list.max()
+)
+val_df = val_df.with_columns(
     pl.col("intensity_array") / pl.col("intensity_array").list.max()
 )
 
-# Split into train/val (dummy split for now)
-train_mzmls = ["b1945_293T_proteinID_09B_QE3_122212.mzML"]
-train_idx = ms1_df["peak_file"].is_in(train_mzmls)
-val_idx = ~train_idx
-
-train_df = ms1_df.filter(train_idx)
-val_df = ms1_df.filter(val_idx)
-train_dataset = dc.data.SpectrumDataset(train_df, batch_size=2)
-val_dataset = dc.data.SpectrumDataset(val_df, batch_size=2)
+train_dataset = SpectrumDataset(train_df, batch_size=2)
+val_dataset = SpectrumDataset(val_df, batch_size=2)
 print("N train spectra", train_dataset.n_spectra)
 print("N val spectra:", val_dataset.n_spectra)
-
 
 train_dataset.batch_size = BATCH_SIZE
 train_loader = DataLoader(train_dataset, batch_size=None, num_workers=1)
 val_dataset.batch_size = BATCH_SIZE
 val_loader = DataLoader(val_dataset, batch_size=None, num_workers=1)
 
-
 root_dir = os.path.join(CHECKPOINT_PATH, "foundation_model")
 os.makedirs(root_dir, exist_ok=True)
 
 logger = L.loggers.TensorBoardLogger(
     os.path.join(root_dir, "lightning_logs"),
-    name="test_ms1_model",
+    name=config["name"],
 )
 
 # TODO: set reasonable hyperparameters and move them to constants/config
 model = MS1Encoder(
-    d_model=12,  # 8,
-    nhead=1,  # 8,
-    dim_feedforward=24,  # 512,
-    n_layers=1,  # ,
-    dropout=0.1,
-    n_bins=2000,
-    bin_mz_min=0,
-    bin_mz_max=2000,
-    masked_peaks_fraction=0.3,
-    lr=5e-4,
-    warmup_iters=1000,
-    cosine_schedule_period_iters=32000,
+    d_model=config["model"]["d_model"],
+    nhead=config["model"]["nhead"],
+    dim_feedforward=config["model"]["dim_feedforward"],
+    n_layers=config["model"]["n_layers"],
+    dropout=config["model"]["dropout"],
+    n_bins=config["model"]["n_bins"],
+    bin_mz_min=config["model"]["bin_mz_min"],
+    bin_mz_max=config["model"]["bin_mz_max"],
+    masked_peaks_fraction=config["model"]["masked_peaks_fraction"],
+    lr=config["optimizer"]["lr"],
+    warmup_iters=config["optimizer"]["warmup_iters"],
+    cosine_schedule_period_iters=config["optimizer"]["cosine_schedule_period_iters"],
 )
 
 trainer = L.Trainer(
@@ -87,10 +110,10 @@ trainer = L.Trainer(
     logger=logger,
     default_root_dir=root_dir,
     callbacks=[],  # [ModelCheckpoint(save_weights_only=True, mode="max", monitor="val_acc")],
-    accelerator="auto",  # "gpu",
-    devices=1,
-    max_epochs=50,
-    gradient_clip_val=5,
+    accelerator=config["training"]["accelerator"],
+    devices=config["training"]["devices"],
+    max_epochs=config["training"]["max_epochs"],
+    gradient_clip_val=config["training"]["gradient_clip_val"],
     num_sanity_val_steps=2,
 )
 

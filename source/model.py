@@ -67,6 +67,10 @@ class MS1Encoder(L.LightningModule):
         self.loss_mz_bin = nn.CrossEntropyLoss(reduction="mean")
         self.loss_I = nn.MSELoss(reduction="mean")
 
+        # metrics
+        # TODO: add accuracy for mz bin prediction
+        # TODO: add MAE for I prediction
+
     def get_peaks_mask(self, intensities):
         # TODO: may want the mask to be proportional to I?
         mask = torch.rand_like(intensities) < self.masked_peaks_fraction
