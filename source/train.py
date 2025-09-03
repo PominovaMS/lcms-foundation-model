@@ -1,5 +1,6 @@
 """Train the model."""  # Should this script be outside of the source folder (as a main entry point)?
 
+import argparse
 import os
 import polars as pl
 import depthcharge as dc
@@ -7,17 +8,19 @@ import pytorch_lightning as L
 from torch.utils.data import DataLoader
 from model import MS1Encoder
 
-# Path to the training data
-DATA_DIR = "../data"
 # Training batch size
 BATCH_SIZE = 20
 # Directory to save model checkpoints and logs
 CHECKPOINT_PATH = "./train_checkpoints"
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--data_dir", required=True, help="The path to the training data.")
+args = parser.parse_args()
+
 # Load training data
 ms1_dfs = [
     dc.data.spectra_to_df(
-        os.path.join(DATA_DIR, mzml_file),
+        os.path.join(args.data_dir, mzml_file),
         metadata_df=None,
         ms_level=1,
         preprocessing_fn=None,
@@ -25,7 +28,7 @@ ms1_dfs = [
         custom_fields=None,
         progress=True,
     )
-    for mzml_file in os.listdir(DATA_DIR)
+    for mzml_file in os.listdir(args.data_dir)
 ]
 ms1_df = pl.concat(ms1_dfs, how="vertical")
 
