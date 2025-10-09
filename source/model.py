@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torchmetrics
 import pytorch_lightning as L
 from depthcharge.encoders import PeakEncoder
 from depthcharge.transformers import SpectrumTransformerEncoder
@@ -54,8 +55,6 @@ class MS1Encoder(L.LightningModule):
             peak_encoder=self.peak_encoder,
         )
 
-        # lol we don't have SpectrumTransformer here
-
         self.head_mz = nn.Sequential(
             nn.Linear(d_model, n_bins),
         )  # outputs n_bins logits for each peak
@@ -66,10 +65,11 @@ class MS1Encoder(L.LightningModule):
         # losses
         self.loss_mz_bin = nn.CrossEntropyLoss(reduction="mean")
         self.loss_I = nn.MSELoss(reduction="mean")
-
         # metrics
-        # TODO: add accuracy for mz bin prediction
-        # TODO: add MAE for I prediction
+        self.train_accuracy_mz_bin = torchmetrics.classification.Accuracy(task="multiclass", num_classes=self.n_bins)
+        self.val_accuracy_mz_bin = torchmetrics.classification.Accuracy(task="multiclass", num_classes=self.n_bins)
+        self.train_mae_I = torchmetrics.regression.MeanAbsoluteError()
+        self.val_mae_I = torchmetrics.regression.MeanAbsoluteError()
 
     def get_peaks_mask(self, intensities):
         # TODO: may want the mask to be proportional to I?
@@ -130,6 +130,12 @@ class MS1Encoder(L.LightningModule):
         self.log("train_loss_mz_bin", loss_mz_bin.item())
         self.log("train_loss_I", loss_I.item())
         self.log("train_loss", loss.item())
+        # Accuracy metric for mz bin prediction
+        acc_mz_bin = self.train_accuracy_mz_bin(pred_mz_bins, target_mz_bins)
+        self.log("train_acc_mz_bin", acc_mz_bin.item(), prog_bar=True, on_step=True, on_epoch=False)
+        # MAE metric for intensity prediction
+        mae_I = self.train_mae_I(pred_I, target_I)
+        self.log("train_mae_I", mae_I.item(), prog_bar=True, on_step=True, on_epoch=False)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -163,6 +169,12 @@ class MS1Encoder(L.LightningModule):
         self.log("val_loss_mz_bin", loss_mz_bin.item())
         self.log("val_loss_I", loss_I.item())
         self.log("val_loss", loss.item())
+        # Accuracy metric for mz bin prediction
+        acc_mz_bin = self.val_accuracy_mz_bin(pred_mz_bins, target_mz_bins)
+        self.log("val_acc_mz_bin", acc_mz_bin.item(), prog_bar=True, on_step=False, on_epoch=True)
+        # MAE metric for intensity prediction
+        mae_I = self.val_mae_I(pred_I, target_I)
+        self.log("val_mae_I", mae_I.item(), prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
     def configure_optimizers(
