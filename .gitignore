@@ -208,3 +208,6 @@ __marimo__/
 
 # Example data files
 data/
+
+# Experiment logs
+source/train_checkpoints/
