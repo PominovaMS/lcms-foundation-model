@@ -21,14 +21,14 @@ model:
   
 # Optimizer settings
 optimizer:
-  lr: 5e-4
+  lr: 0.0005
   warmup_iters: 1000
-  cosine_schedule_period_iters: 32000
+  cosine_schedule_period_iters: 64000
 
 # Training settings
 training:
   checkpoint_path: "./train_checkpoints"
-  max_epochs: 50
+  max_epochs: 200
   gradient_clip_val: 5
   accelerator: "gpu"
   devices: 1

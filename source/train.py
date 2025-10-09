@@ -8,12 +8,20 @@ import pytorch_lightning as L
 from depthcharge.data import SpectrumDataset, spectra_to_df
 from torch.utils.data import DataLoader
 from model import MS1Encoder
+from config import ExperimentConfig, DataConfig, ModelConfig, OptimizerConfig, TrainingConfig
 
 
 def load_config(config_path):
     """Load configuration from YAML file."""
     with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
+        config_dict = yaml.safe_load(f)
+        config = ExperimentConfig(
+            name=config_dict['name'],
+            data=DataConfig(**config_dict['data']),
+            model=ModelConfig(**config_dict['model']),
+            optimizer=OptimizerConfig(**config_dict['optimizer']),
+            training=TrainingConfig(**config_dict['training'])
+        )
     return config
 
 
@@ -28,8 +36,8 @@ args = parser.parse_args()
 config = load_config(args.config)
 
 # Extract configuration values
-BATCH_SIZE = config["data"]["batch_size"]
-CHECKPOINT_PATH = config["training"]["checkpoint_path"]
+BATCH_SIZE = config.data.batch_size
+CHECKPOINT_PATH = config.training.checkpoint_path
 
 # Load training data
 train_data_dir = os.path.join(args.data_dir, "train_mzml")
@@ -77,32 +85,32 @@ print("N train spectra", train_dataset.n_spectra)
 print("N val spectra:", val_dataset.n_spectra)
 
 train_dataset.batch_size = BATCH_SIZE
-train_loader = DataLoader(train_dataset, batch_size=None, num_workers=1)
+train_loader = DataLoader(train_dataset, batch_size=None, num_workers=0)
 val_dataset.batch_size = BATCH_SIZE
-val_loader = DataLoader(val_dataset, batch_size=None, num_workers=1)
+val_loader = DataLoader(val_dataset, batch_size=None, num_workers=0)
 
 root_dir = os.path.join(CHECKPOINT_PATH, "foundation_model")
 os.makedirs(root_dir, exist_ok=True)
 
 logger = L.loggers.TensorBoardLogger(
     os.path.join(root_dir, "lightning_logs"),
-    name=config["name"],
+    name=config.name,
 )
 
 # TODO: set reasonable hyperparameters and move them to constants/config
 model = MS1Encoder(
-    d_model=config["model"]["d_model"],
-    nhead=config["model"]["nhead"],
-    dim_feedforward=config["model"]["dim_feedforward"],
-    n_layers=config["model"]["n_layers"],
-    dropout=config["model"]["dropout"],
-    n_bins=config["model"]["n_bins"],
-    bin_mz_min=config["model"]["bin_mz_min"],
-    bin_mz_max=config["model"]["bin_mz_max"],
-    masked_peaks_fraction=config["model"]["masked_peaks_fraction"],
-    lr=config["optimizer"]["lr"],
-    warmup_iters=config["optimizer"]["warmup_iters"],
-    cosine_schedule_period_iters=config["optimizer"]["cosine_schedule_period_iters"],
+    d_model=config.model.d_model,
+    nhead=config.model.nhead,
+    dim_feedforward=config.model.dim_feedforward,
+    n_layers=config.model.n_layers,
+    dropout=config.model.dropout,
+    n_bins=config.model.n_bins,
+    bin_mz_min=config.model.bin_mz_min,
+    bin_mz_max=config.model.bin_mz_max,
+    masked_peaks_fraction=config.model.masked_peaks_fraction,
+    lr=config.optimizer.lr,
+    warmup_iters=config.optimizer.warmup_iters,
+    cosine_schedule_period_iters=config.optimizer.cosine_schedule_period_iters,
 )
 
 trainer = L.Trainer(
@@ -110,10 +118,10 @@ trainer = L.Trainer(
     logger=logger,
     default_root_dir=root_dir,
     callbacks=[],  # [ModelCheckpoint(save_weights_only=True, mode="max", monitor="val_acc")],
-    accelerator=config["training"]["accelerator"],
-    devices=config["training"]["devices"],
-    max_epochs=config["training"]["max_epochs"],
-    gradient_clip_val=config["training"]["gradient_clip_val"],
+    accelerator=config.training.accelerator,
+    devices=config.training.devices,
+    max_epochs=config.training.max_epochs,
+    gradient_clip_val=config.training.gradient_clip_val,
     num_sanity_val_steps=2,
 )
 
