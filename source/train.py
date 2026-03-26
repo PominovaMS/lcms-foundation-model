@@ -5,7 +5,7 @@ import os
 import yaml
 import polars as pl
 import pytorch_lightning as L
-from depthcharge.data import SpectrumDataset, spectra_to_df
+from depthcharge.data import SpectrumDataset, spectra_to_df, preprocessing
 from torch.utils.data import DataLoader
 from model import MS1Encoder
 from config import ExperimentConfig, DataConfig, ModelConfig, OptimizerConfig, TrainingConfig
@@ -43,41 +43,38 @@ CHECKPOINT_PATH = config.training.checkpoint_path
 train_data_dir = os.path.join(args.data_dir, "train_mzml")
 val_data_dir = os.path.join(args.data_dir, "val_mzml")
 
+preprocessing_fn = [
+    preprocessing.filter_intensity(max_num_peaks=config.data.max_num_peaks),
+    preprocessing.scale_intensity(scaling="root", max_intensity=1.),
+]
+
 dfs = [
     spectra_to_df(
         os.path.join(train_data_dir, mzml_file),
         metadata_df=None,
         ms_level=1,
-        preprocessing_fn=None,
+        preprocessing_fn=preprocessing_fn,
         valid_charge=None,
         custom_fields=None,
         progress=True,
     )
-    for mzml_file in os.listdir(train_data_dir)
+    for mzml_file in os.listdir(train_data_dir)[:1]
 ]
 train_df = pl.concat(dfs, how="vertical")
 
-dfs = [
-    spectra_to_df(
-        os.path.join(val_data_dir, mzml_file),
-        metadata_df=None,
-        ms_level=1,
-        preprocessing_fn=None,
-        valid_charge=None,
-        custom_fields=None,
-        progress=True,
-    )
-    for mzml_file in os.listdir(val_data_dir)
-]
+# dfs = [
+#     spectra_to_df(
+#         os.path.join(val_data_dir, mzml_file),
+#         metadata_df=None,
+#         ms_level=1,
+#         preprocessing_fn=preprocessing_fn,
+#         valid_charge=None,
+#         custom_fields=None,
+#         progress=True,
+#     )
+#     for mzml_file in os.listdir(val_data_dir)
+# ]
 val_df = pl.concat(dfs, how="vertical")
-
-# Rescale Intensities in the dataframe to [0, 1].
-train_df = train_df.with_columns(
-    pl.col("intensity_array") / pl.col("intensity_array").list.max()
-)
-val_df = val_df.with_columns(
-    pl.col("intensity_array") / pl.col("intensity_array").list.max()
-)
 
 train_dataset = SpectrumDataset(train_df, batch_size=2)
 val_dataset = SpectrumDataset(val_df, batch_size=2)

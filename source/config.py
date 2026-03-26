@@ -6,6 +6,7 @@ class DataConfig:
     train_dir: str
     val_dir: str
     batch_size: int
+    max_num_peaks: int
 
 @dataclass
 class ModelConfig:
