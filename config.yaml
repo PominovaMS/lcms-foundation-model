@@ -1,18 +1,21 @@
 # Experiment configuration
-name: "test_ms1_model"
+name: "ms1-mz-200_peaks-sqrt-clf_run_retrain" # ms1 # retrain finetuning
+# name: "ms1-mz-200_peaks-sqrt-clf_run" # ms1 # online finetuning
+# name: "ms1-mz-pos-200_peaks-sqrt" # ms1
 
 # Data configuration
 data:
   train_dir: "train_mzml"
   val_dir: "val_mzml"
   batch_size: 2000
+  max_num_peaks: 200
 
 # Model configuration
 model:
   d_model: 256
   nhead: 8
   dim_feedforward: 512
-  n_layers: 4
+  n_layers: 6
   dropout: 0.1
   n_bins: 1200
   bin_mz_min: 300
@@ -21,14 +24,14 @@ model:
   
 # Optimizer settings
 optimizer:
-  lr: 0.0005
+  lr: 0.0005 # 0.0003
   warmup_iters: 1000
-  cosine_schedule_period_iters: 64000
+  cosine_schedule_period_iters: 64000 # 32000
 
 # Training settings
 training:
   checkpoint_path: "./train_checkpoints"
-  max_epochs: 200
+  max_epochs: 1000 # 200
   gradient_clip_val: 5
   accelerator: "gpu"
   devices: 1
