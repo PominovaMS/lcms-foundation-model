@@ -19,13 +19,13 @@ def load_metadata(meta_path: str) -> pl.DataFrame:
     Adds `peak_file` column (data_file + ".mzML").
     """
     meta_df = pl.read_csv(meta_path)
-    meta_df = meta_df.rename({
-        "characteristics[organism]": "organism",
-        "comment[data file]": "data_file",
-    })
-    meta_df = meta_df.with_columns(
-        (pl.col("data_file") + ".mzML").alias("peak_file")
+    meta_df = meta_df.rename(
+        {
+            "characteristics[organism]": "organism",
+            "comment[data file]": "data_file",
+        }
     )
+    meta_df = meta_df.with_columns((pl.col("data_file") + ".mzML").alias("peak_file"))
     return meta_df
 
 
@@ -52,8 +52,7 @@ def assign_splits(
     """
     # --- count species & files per genus ---
     genus_stats = (
-        meta_df
-        .group_by("genus")
+        meta_df.group_by("genus")
         .agg(
             pl.col("organism").n_unique().alias("n_species"),
             pl.len().alias("n_files"),
@@ -108,7 +107,9 @@ def assign_splits(
             else:
                 species_to_split[species] = "probe_val"
                 n_val += 1
-        probe_genus_summary.append((genus, len(genus_df), len(species_list), n_train, n_val))
+        probe_genus_summary.append(
+            (genus, len(genus_df), len(species_list), n_train, n_val)
+        )
 
     # --- build split + genus_class columns ---
     def _get_split(row):
@@ -135,8 +136,7 @@ def assign_splits(
     # --- log summary ---
     ssl_df = meta_df.filter(pl.col("split") == "train")
     ssl_genus_counts = (
-        ssl_df.group_by("genus").agg(pl.len().alias("n"))
-        .sort("n", descending=True)
+        ssl_df.group_by("genus").agg(pl.len().alias("n")).sort("n", descending=True)
     )
     top_ssl = ssl_genus_counts.head(5)["genus"].to_list()
     logger.info(
@@ -144,8 +144,10 @@ def assign_splits(
         f"(top: {', '.join(top_ssl)}, ...)"
     )
 
-    logger.info(f"Probe: {n_probe_genera} genera, "
-                f"{meta_df.filter(pl.col('split') != 'train').shape[0]} files")
+    logger.info(
+        f"Probe: {n_probe_genera} genera, "
+        f"{meta_df.filter(pl.col('split') != 'train').shape[0]} files"
+    )
     for genus, n_files, n_sp, n_train, n_val in probe_genus_summary:
         cls = genus_to_class[genus]
         logger.info(
@@ -209,7 +211,9 @@ def run_collate_fn(rows):
     return batch
 
 
-def build_dataloaders(dfs: dict, meta_df: pl.DataFrame, config, n_ssl_files: int | None = None):
+def build_dataloaders(
+    dfs: dict, meta_df: pl.DataFrame, config, n_ssl_files: int | None = None
+):
     """
     Build all four DataLoaders for an eval experiment.
 
@@ -232,11 +236,15 @@ def build_dataloaders(dfs: dict, meta_df: pl.DataFrame, config, n_ssl_files: int
 
     # --- SSL datasets (spectrum-level, stored in Lance) ---
     def _make_ssl_dataset(split_names, max_files=None):
-        files = meta_df.filter(pl.col("split").is_in(split_names))["peak_file"].to_list()
+        files = meta_df.filter(pl.col("split").is_in(split_names))[
+            "peak_file"
+        ].to_list()
         if max_files is not None and len(files) > max_files:
             # Deterministic cap: sort alphabetically, take first N
             files = sorted(files)[:max_files]
-            logger.info(f"SSL train capped to {max_files}/{len(meta_df.filter(pl.col('split').is_in(split_names)))} files")
+            logger.info(
+                f"SSL train capped to {max_files}/{len(meta_df.filter(pl.col('split').is_in(split_names)))} files"
+            )
         df = pl.concat([dfs[f] for f in files], how="vertical")
         df = df.join(meta_df, on="peak_file", how="left")
         stream = SpectrumDataset(
@@ -248,8 +256,12 @@ def build_dataloaders(dfs: dict, meta_df: pl.DataFrame, config, n_ssl_files: int
     train_dataset = _make_ssl_dataset(["train"], max_files=n_ssl_files)
     val_dataset = _make_ssl_dataset(["probe_train", "probe_val"])
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, num_workers=0, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, num_workers=0, shuffle=False)
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, num_workers=0, shuffle=True
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, num_workers=0, shuffle=False
+    )
 
     # --- Probe datasets (run-level) ---
     run_labels = dict(zip(meta_df["peak_file"], meta_df["genus_class"]))

@@ -8,7 +8,13 @@ import pytorch_lightning as L
 from depthcharge.data import SpectrumDataset, spectra_to_df, preprocessing
 from torch.utils.data import DataLoader
 from model import MS1Encoder
-from config import ExperimentConfig, DataConfig, ModelConfig, OptimizerConfig, TrainingConfig
+from config import (
+    ExperimentConfig,
+    DataConfig,
+    ModelConfig,
+    OptimizerConfig,
+    TrainingConfig,
+)
 
 
 def load_config(config_path):
@@ -16,11 +22,11 @@ def load_config(config_path):
     with open(config_path, "r") as f:
         config_dict = yaml.safe_load(f)
         config = ExperimentConfig(
-            name=config_dict['name'],
-            data=DataConfig(**config_dict['data']),
-            model=ModelConfig(**config_dict['model']),
-            optimizer=OptimizerConfig(**config_dict['optimizer']),
-            training=TrainingConfig(**config_dict['training'])
+            name=config_dict["name"],
+            data=DataConfig(**config_dict["data"]),
+            model=ModelConfig(**config_dict["model"]),
+            optimizer=OptimizerConfig(**config_dict["optimizer"]),
+            training=TrainingConfig(**config_dict["training"]),
         )
     return config
 
@@ -45,7 +51,7 @@ val_data_dir = os.path.join(args.data_dir, "val_mzml")
 
 preprocessing_fn = [
     preprocessing.filter_intensity(max_num_peaks=config.data.max_num_peaks),
-    preprocessing.scale_intensity(scaling="root", max_intensity=1.),
+    preprocessing.scale_intensity(scaling="root", max_intensity=1.0),
 ]
 
 dfs = [

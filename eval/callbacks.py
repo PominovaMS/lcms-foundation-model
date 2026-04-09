@@ -49,7 +49,9 @@ class FineTuner(L.Callback):
         self.probe_val_loader = probe_val_loader
 
     def _init_model_opt(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
-        self.finetuner = nn.Linear(self.encoder_output_dim, self.num_classes).to(pl_module.device)
+        self.finetuner = nn.Linear(self.encoder_output_dim, self.num_classes).to(
+            pl_module.device
+        )
         self.optimizer = torch.optim.Adam(self.finetuner.parameters(), lr=self.lr)
 
     def _encode_run(self, pl_module, run_mz, run_I):
@@ -84,16 +86,20 @@ class FineTuner(L.Callback):
 
         if not train:
             n = 30
-            sample_df = np.hstack((
-                targets[:n].cpu().numpy()[:, None],
-                F.softmax(preds, dim=1)[:n].detach().cpu().numpy(),
-            ))
+            sample_df = np.hstack(
+                (
+                    targets[:n].cpu().numpy()[:, None],
+                    F.softmax(preds, dim=1)[:n].detach().cpu().numpy(),
+                )
+            )
             col_names = ["targets"] + [f"prob_{i}" for i in range(self.num_classes)]
             print(pd.DataFrame(sample_df, columns=col_names).to_string())
 
         return loss.detach(), acc.detach()
 
-    def on_train_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+    def on_train_epoch_end(
+        self, trainer: L.Trainer, pl_module: L.LightningModule
+    ) -> None:
         # Only retrain + evaluate the probe every N SSL epochs to save time
         if trainer.current_epoch % self.eval_every_n_epochs != 0:
             return
@@ -104,7 +110,9 @@ class FineTuner(L.Callback):
         self.finetuner.train()
 
         probe_epoch = 0
-        avg_loss = float("inf")  # start high so the while condition enters on first iteration
+        avg_loss = float(
+            "inf"
+        )  # start high so the while condition enters on first iteration
         avg_acc = 0.0
 
         while (avg_loss > self.min_train_loss) and (
@@ -122,13 +130,19 @@ class FineTuner(L.Callback):
             print(f"Probe epoch {probe_epoch} loss: {avg_loss:.4f}  acc: {avg_acc:.4f}")
             probe_epoch += 1
 
-        pl_module.log("retrain_train_loss", avg_loss, on_step=False, on_epoch=True, prog_bar=False)
-        pl_module.log("retrain_train_acc", avg_acc, on_step=False, on_epoch=True, prog_bar=False)
+        pl_module.log(
+            "retrain_train_loss", avg_loss, on_step=False, on_epoch=True, prog_bar=False
+        )
+        pl_module.log(
+            "retrain_train_acc", avg_acc, on_step=False, on_epoch=True, prog_bar=False
+        )
 
         if was_training:
             pl_module.train()
 
-    def on_validation_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+    def on_validation_epoch_end(
+        self, trainer: L.Trainer, pl_module: L.LightningModule
+    ) -> None:
         # workaround for num_sanity_val_steps > 0
         if not hasattr(self, "finetuner"):
             self._init_model_opt(trainer, pl_module)
@@ -152,8 +166,12 @@ class FineTuner(L.Callback):
         avg_loss = total_loss / n_batches
         avg_acc = total_acc / n_batches
 
-        pl_module.log("retrain_val_loss", avg_loss, on_step=False, on_epoch=True, prog_bar=False)
-        pl_module.log("retrain_val_acc", avg_acc, on_step=False, on_epoch=True, prog_bar=True)
+        pl_module.log(
+            "retrain_val_loss", avg_loss, on_step=False, on_epoch=True, prog_bar=False
+        )
+        pl_module.log(
+            "retrain_val_acc", avg_acc, on_step=False, on_epoch=True, prog_bar=True
+        )
 
         if was_training:
             pl_module.train()
@@ -232,16 +250,20 @@ class OnlineFineTuner(L.Callback):
 
         if not train:
             n = 30
-            sample_df = np.hstack((
-                targets[:n].cpu().numpy()[:, None],
-                F.softmax(preds, dim=1)[:n].detach().cpu().numpy(),
-            ))
+            sample_df = np.hstack(
+                (
+                    targets[:n].cpu().numpy()[:, None],
+                    F.softmax(preds, dim=1)[:n].detach().cpu().numpy(),
+                )
+            )
             col_names = ["targets"] + [f"prob_{i}" for i in range(self.num_classes)]
             print(pd.DataFrame(sample_df, columns=col_names).to_string())
 
         return loss.detach(), acc.detach()
 
-    def on_train_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+    def on_train_epoch_end(
+        self, trainer: L.Trainer, pl_module: L.LightningModule
+    ) -> None:
         was_training = pl_module.training
         pl_module.eval()
         pl_module.online_finetuner.train()
@@ -256,13 +278,19 @@ class OnlineFineTuner(L.Callback):
         avg_loss = total_loss / n_batches
         avg_acc = total_acc / n_batches
 
-        pl_module.log("online_train_loss", avg_loss, on_step=False, on_epoch=True, prog_bar=False)
-        pl_module.log("online_train_acc", avg_acc, on_step=False, on_epoch=True, prog_bar=False)
+        pl_module.log(
+            "online_train_loss", avg_loss, on_step=False, on_epoch=True, prog_bar=False
+        )
+        pl_module.log(
+            "online_train_acc", avg_acc, on_step=False, on_epoch=True, prog_bar=False
+        )
 
         if was_training:
             pl_module.train()
 
-    def on_validation_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+    def on_validation_epoch_end(
+        self, trainer: L.Trainer, pl_module: L.LightningModule
+    ) -> None:
         was_training = pl_module.training
         pl_module.eval()
         pl_module.online_finetuner.eval()
@@ -278,8 +306,12 @@ class OnlineFineTuner(L.Callback):
         avg_loss = total_loss / n_batches
         avg_acc = total_acc / n_batches
 
-        pl_module.log("online_val_loss", avg_loss, on_step=False, on_epoch=True, prog_bar=False)
-        pl_module.log("online_val_acc", avg_acc, on_step=False, on_epoch=True, prog_bar=True)
+        pl_module.log(
+            "online_val_loss", avg_loss, on_step=False, on_epoch=True, prog_bar=False
+        )
+        pl_module.log(
+            "online_val_acc", avg_acc, on_step=False, on_epoch=True, prog_bar=True
+        )
 
         if was_training:
             pl_module.train()

@@ -1,5 +1,5 @@
 import numpy as np
-import pandas as pd # DEBUG
+import pandas as pd  # DEBUG
 import torch
 import torch.nn as nn
 import torchmetrics
@@ -10,6 +10,7 @@ from .scheduler import CosineWarmupScheduler
 
 # from IPython.display import clear_output # DEBUG
 # pd.set_option('display.max_rows', 500) # DEBUG
+
 
 # <01/01/26 TODO: update model
 class MS1Encoder(L.LightningModule):
@@ -82,8 +83,12 @@ class MS1Encoder(L.LightningModule):
         self.loss_mz_bin = nn.CrossEntropyLoss(reduction="mean", ignore_index=-1)
         self.loss_I = nn.MSELoss(reduction="mean")
         # metrics
-        self.train_accuracy_mz_bin = torchmetrics.classification.Accuracy(task="multiclass", num_classes=self.n_bins, ignore_index=-1)
-        self.val_accuracy_mz_bin = torchmetrics.classification.Accuracy(task="multiclass", num_classes=self.n_bins, ignore_index=-1)
+        self.train_accuracy_mz_bin = torchmetrics.classification.Accuracy(
+            task="multiclass", num_classes=self.n_bins, ignore_index=-1
+        )
+        self.val_accuracy_mz_bin = torchmetrics.classification.Accuracy(
+            task="multiclass", num_classes=self.n_bins, ignore_index=-1
+        )
         self.train_mae_I = torchmetrics.regression.MeanAbsoluteError()
         self.val_mae_I = torchmetrics.regression.MeanAbsoluteError()
 
@@ -94,11 +99,17 @@ class MS1Encoder(L.LightningModule):
             # FIXME: assume we have no zero rows (= spectra with no peaks)
 
             # compute sampling weights w
-            I_mean = intensities.sum(dim=1) / (intensities != 0).sum(dim=1) # mean I of non-zero peaks
-            w = intensities + (intensities == 0).float() * I_mean[:, None]  # weight 0s by mean I
+            I_mean = intensities.sum(dim=1) / (intensities != 0).sum(
+                dim=1
+            )  # mean I of non-zero peaks
+            w = (
+                intensities + (intensities == 0).float() * I_mean[:, None]
+            )  # weight 0s by mean I
             # sample k indices without replacement, weighted by w
             idx = torch.multinomial(w, num_samples=k, replacement=False)
-            mask = mask.scatter(dim=1, index=idx.to(dtype=torch.int64), value=True) # value to write into mask (True)
+            mask = mask.scatter(
+                dim=1, index=idx.to(dtype=torch.int64), value=True
+            )  # value to write into mask (True)
 
         else:
             mask = torch.rand_like(intensities) < self.masked_peaks_fraction
@@ -144,10 +155,10 @@ class MS1Encoder(L.LightningModule):
         # mask input peaks with 0 (before encoding)
         masked_mz = mz * (1 - masks.float())
         # masked_I = I * (1 - masks.float()) # FIX: not mask intensities, only mz
-        
+
         # get embeddings for all peaks
         # peak_embs = self.forward(masked_mz, masked_I)
-        peak_embs = self.forward(masked_mz, I) # FIX: not mask intensities, only mz
+        peak_embs = self.forward(masked_mz, I)  # FIX: not mask intensities, only mz
         # select only embeddings of masked peaks
         masked_peak_embs = peak_embs[masks]
         # predict masked peaks binned mz & I
@@ -156,13 +167,19 @@ class MS1Encoder(L.LightningModule):
 
         loss_mz_bin = self.loss_mz_bin(pred_mz_bins, target_mz_bins)
         loss_I = self.loss_I(pred_I, target_I)
-        loss = loss_mz_bin# + loss_I
+        loss = loss_mz_bin  # + loss_I
         self.log("train_loss_mz_bin", loss_mz_bin.item())
         # self.log("train_loss_I", loss_I.item())
         self.log("train_loss", loss.item())
         # Accuracy metric for mz bin prediction
         acc_mz_bin = self.train_accuracy_mz_bin(pred_mz_bins, target_mz_bins)
-        self.log("train_acc_mz_bin", acc_mz_bin.item(), prog_bar=True, on_step=True, on_epoch=False)
+        self.log(
+            "train_acc_mz_bin",
+            acc_mz_bin.item(),
+            prog_bar=True,
+            on_step=True,
+            on_epoch=False,
+        )
         # MAE metric for intensity prediction
         # mae_I = self.train_mae_I(pred_I, target_I)
         # self.log("train_mae_I", mae_I.item(), prog_bar=True, on_step=True, on_epoch=False)
@@ -185,10 +202,10 @@ class MS1Encoder(L.LightningModule):
         # mask input peaks with 0 (before encoding)
         masked_mz = mz * (1 - masks.float())
         # masked_I = I * (1 - masks.float()) # FIX: not mask intensities, only mz
-        
+
         # get embeddings for all peaks
         # peak_embs = self.forward(masked_mz, masked_I)
-        peak_embs = self.forward(masked_mz, I) # FIX: not mask intensities, only mz
+        peak_embs = self.forward(masked_mz, I)  # FIX: not mask intensities, only mz
         # select only embeddings of masked peaks
         masked_peak_embs = peak_embs[masks]
         # predict masked peaks binned mz & I
@@ -197,13 +214,19 @@ class MS1Encoder(L.LightningModule):
 
         loss_mz_bin = self.loss_mz_bin(pred_mz_bins, target_mz_bins)
         # loss_I = self.loss_I(pred_I, target_I)
-        loss = loss_mz_bin# + loss_I
+        loss = loss_mz_bin  # + loss_I
         self.log("val_loss_mz_bin", loss_mz_bin.item())
         # self.log("val_loss_I", loss_I.item())
         self.log("val_loss", loss.item())
         # Accuracy metric for mz bin prediction
         acc_mz_bin = self.val_accuracy_mz_bin(pred_mz_bins, target_mz_bins)
-        self.log("val_acc_mz_bin", acc_mz_bin.item(), prog_bar=True, on_step=False, on_epoch=True)
+        self.log(
+            "val_acc_mz_bin",
+            acc_mz_bin.item(),
+            prog_bar=True,
+            on_step=False,
+            on_epoch=True,
+        )
         # MAE metric for intensity prediction
         # mae_I = self.val_mae_I(pred_I, target_I)
         # self.log("val_mae_I", mae_I.item(), prog_bar=True, on_step=False, on_epoch=True)
@@ -216,29 +239,34 @@ class MS1Encoder(L.LightningModule):
         # target_mz_bins = self.get_mz_bins(target_mz)
 
         n = 30
-        mz_bins_true, I_true = target_mz_bins[:n].cpu().numpy(), target_I[:n].cpu().numpy()
-        mz_bins_pred, I_pred = pred_mz_bins[:n].argmax(dim=1).cpu().numpy(), pred_I[:n].cpu().numpy()
-        sample_df = np.column_stack((
-            mz_bins_true.ravel(), 
-            I_true.ravel(), 
-            mz_bins_pred.ravel(), 
-            # I_pred.ravel()
-        ))
-        sample_df = pd.DataFrame(
-            sample_df, columns=[
-                "mz_bins_true", 
-                "I_true", 
-                "mz_bins_pred", 
-                # "I_pred"
-            ]
+        mz_bins_true, I_true = (
+            target_mz_bins[:n].cpu().numpy(),
+            target_I[:n].cpu().numpy(),
         )
-        display(sample_df)
-        
-        return loss
+        mz_bins_pred, I_pred = (
+            pred_mz_bins[:n].argmax(dim=1).cpu().numpy(),
+            pred_I[:n].cpu().numpy(),
+        )
+        sample_df = np.column_stack(
+            (
+                mz_bins_true.ravel(),
+                I_true.ravel(),
+                mz_bins_pred.ravel(),
+                # I_pred.ravel()
+            )
+        )
+        sample_df = pd.DataFrame(
+            sample_df,
+            columns=[
+                "mz_bins_true",
+                "I_true",
+                "mz_bins_pred",
+                # "I_pred"
+            ],
+        )
+        print(sample_df.to_string())
 
-    def on_validation_epoch_start(self,):
-        clear_output(True)
-        return
+        return loss
 
     def configure_optimizers(
         self,

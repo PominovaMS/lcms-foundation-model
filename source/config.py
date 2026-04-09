@@ -1,12 +1,14 @@
 from dataclasses import dataclass
 from typing import Optional
 
+
 @dataclass
 class DataConfig:
     train_dir: str
     val_dir: str
     batch_size: int
     max_num_peaks: int
+
 
 @dataclass
 class ModelConfig:
@@ -20,11 +22,13 @@ class ModelConfig:
     bin_mz_max: int
     masked_peaks_fraction: float
 
+
 @dataclass
 class OptimizerConfig:
     lr: float
     warmup_iters: int
     cosine_schedule_period_iters: int
+
 
 @dataclass
 class TrainingConfig:
@@ -34,6 +38,7 @@ class TrainingConfig:
     accelerator: str
     devices: int
 
+
 @dataclass
 class ExperimentConfig:
     name: str
@@ -41,4 +46,3 @@ class ExperimentConfig:
     model: ModelConfig
     optimizer: OptimizerConfig
     training: TrainingConfig
-

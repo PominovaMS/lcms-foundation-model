@@ -25,7 +25,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytorch_lightning as L
 
 from source.model import MS1Encoder
-from source.config import ExperimentConfig, DataConfig, ModelConfig, OptimizerConfig, TrainingConfig
+from source.config import (
+    ExperimentConfig,
+    DataConfig,
+    ModelConfig,
+    OptimizerConfig,
+    TrainingConfig,
+)
 from callbacks import OnlineFineTuner
 from data import load_metadata, load_mzml_data, assign_splits, build_dataloaders
 
@@ -45,17 +51,33 @@ def load_config(config_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SSL pretrain + online downstream eval")
-    parser.add_argument("--data_dir", required=True, help="Directory containing mzML files")
+    parser = argparse.ArgumentParser(
+        description="SSL pretrain + online downstream eval"
+    )
+    parser.add_argument(
+        "--data_dir", required=True, help="Directory containing mzML files"
+    )
     parser.add_argument("--meta_path", required=True, help="Path to metadata CSV")
     parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
     # Split control
-    parser.add_argument("--n_probe_genera", type=int, default=15,
-                        help="Number of genera for downstream probe task (default: 15)")
-    parser.add_argument("--n_ssl_top", type=int, default=3,
-                        help="Number of largest genera always reserved for SSL (default: 3)")
-    parser.add_argument("--n_ssl_files", type=int, default=None,
-                        help="Cap SSL training files to this many (default: use all)")
+    parser.add_argument(
+        "--n_probe_genera",
+        type=int,
+        default=15,
+        help="Number of genera for downstream probe task (default: 15)",
+    )
+    parser.add_argument(
+        "--n_ssl_top",
+        type=int,
+        default=3,
+        help="Number of largest genera always reserved for SSL (default: 3)",
+    )
+    parser.add_argument(
+        "--n_ssl_files",
+        type=int,
+        default=None,
+        help="Cap SSL training files to this many (default: use all)",
+    )
     # Probe hyperparameters
     parser.add_argument("--probe_lr", type=float, default=1e-3)
     parser.add_argument("--ssl_max_epochs", type=int, default=500)
@@ -65,7 +87,9 @@ def main():
 
     # Load and split metadata
     meta_df = load_metadata(args.meta_path)
-    meta_df = assign_splits(meta_df, n_probe_genera=args.n_probe_genera, n_ssl_top=args.n_ssl_top)
+    meta_df = assign_splits(
+        meta_df, n_probe_genera=args.n_probe_genera, n_ssl_top=args.n_ssl_top
+    )
 
     # Load mzML files
     peak_files = meta_df["peak_file"].to_list()
@@ -76,12 +100,14 @@ def main():
         dfs, meta_df, config, n_ssl_files=args.n_ssl_files
     )
     logging.info(f"SSL batches — train: {len(train_loader)}, val: {len(val_loader)}")
-    logging.info(f"Probe runs — train: {len(probe_train_loader.dataset)}, val: {len(probe_val_loader.dataset)}")
+    logging.info(
+        f"Probe runs — train: {len(probe_train_loader.dataset)}, val: {len(probe_val_loader.dataset)}"
+    )
 
     # Number of probe classes = number of probe genera
-    num_probe_classes = meta_df.filter(
-        meta_df["genus_class"] >= 0
-    )["genus_class"].n_unique()
+    num_probe_classes = meta_df.filter(meta_df["genus_class"] >= 0)[
+        "genus_class"
+    ].n_unique()
 
     model = MS1Encoder(
         d_model=config.model.d_model,
