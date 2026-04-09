@@ -1,0 +1,134 @@
+"""SSL pretraining with online downstream evaluation.
+
+After each SSL training epoch, one gradient step is taken on the probe
+(linear head over run-level embeddings), then evaluated on probe_val.
+The probe persists across epochs — it is NOT re-initialized.
+
+Usage:
+    python eval/online_eval.py \\
+        --data_dir /mnt/data/shared/lc_ms_foundation/abele_data/mzml \\
+        --meta_path /path/to/all_abele_metadata.csv \\
+        --config config.yaml \\
+        --n_probe_genera 15
+"""
+
+import argparse
+import logging
+import os
+import sys
+import yaml
+from pathlib import Path
+
+# Make project root importable
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import pytorch_lightning as L
+
+from source.model import MS1Encoder
+from source.config import ExperimentConfig, DataConfig, ModelConfig, OptimizerConfig, TrainingConfig
+from callbacks import OnlineFineTuner
+from data import load_metadata, load_mzml_data, assign_splits, build_dataloaders
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+
+def load_config(config_path):
+    with open(config_path) as f:
+        d = yaml.safe_load(f)
+    return ExperimentConfig(
+        name=d["name"],
+        data=DataConfig(**d["data"]),
+        model=ModelConfig(**d["model"]),
+        optimizer=OptimizerConfig(**d["optimizer"]),
+        training=TrainingConfig(**d["training"]),
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="SSL pretrain + online downstream eval")
+    parser.add_argument("--data_dir", required=True, help="Directory containing mzML files")
+    parser.add_argument("--meta_path", required=True, help="Path to metadata CSV")
+    parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
+    # Split control
+    parser.add_argument("--n_probe_genera", type=int, default=15,
+                        help="Number of genera for downstream probe task (default: 15)")
+    parser.add_argument("--n_ssl_top", type=int, default=3,
+                        help="Number of largest genera always reserved for SSL (default: 3)")
+    parser.add_argument("--n_ssl_files", type=int, default=None,
+                        help="Cap SSL training files to this many (default: use all)")
+    # Probe hyperparameters
+    parser.add_argument("--probe_lr", type=float, default=1e-3)
+    parser.add_argument("--ssl_max_epochs", type=int, default=500)
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+
+    # Load and split metadata
+    meta_df = load_metadata(args.meta_path)
+    meta_df = assign_splits(meta_df, n_probe_genera=args.n_probe_genera, n_ssl_top=args.n_ssl_top)
+
+    # Load mzML files
+    peak_files = meta_df["peak_file"].to_list()
+    dfs = load_mzml_data(args.data_dir, peak_files, config.data.max_num_peaks)
+
+    # Build DataLoaders
+    train_loader, val_loader, probe_train_loader, probe_val_loader = build_dataloaders(
+        dfs, meta_df, config, n_ssl_files=args.n_ssl_files
+    )
+    logging.info(f"SSL batches — train: {len(train_loader)}, val: {len(val_loader)}")
+    logging.info(f"Probe runs — train: {len(probe_train_loader.dataset)}, val: {len(probe_val_loader.dataset)}")
+
+    # Number of probe classes = number of probe genera
+    num_probe_classes = meta_df.filter(
+        meta_df["genus_class"] >= 0
+    )["genus_class"].n_unique()
+
+    model = MS1Encoder(
+        d_model=config.model.d_model,
+        nhead=config.model.nhead,
+        dim_feedforward=config.model.dim_feedforward,
+        n_layers=config.model.n_layers,
+        dropout=config.model.dropout,
+        n_bins=config.model.n_bins,
+        bin_mz_min=config.model.bin_mz_min,
+        bin_mz_max=config.model.bin_mz_max,
+        masked_peaks_fraction=config.model.masked_peaks_fraction,
+        lr=config.optimizer.lr,
+        warmup_iters=config.optimizer.warmup_iters,
+        cosine_schedule_period_iters=config.optimizer.cosine_schedule_period_iters,
+    )
+
+    root_dir = os.path.join(config.training.checkpoint_path, "foundation_model")
+    os.makedirs(root_dir, exist_ok=True)
+    logger = L.loggers.TensorBoardLogger(
+        os.path.join(root_dir, "lightning_logs"),
+        name=config.name,
+    )
+
+    online_finetuner = OnlineFineTuner(
+        encoder_output_dim=config.model.d_model,
+        num_classes=num_probe_classes,
+        target_key="label",
+        probe_train_loader=probe_train_loader,
+        probe_val_loader=probe_val_loader,
+        agg_type="mean",
+        probe_lr=args.probe_lr,
+    )
+
+    trainer = L.Trainer(
+        logger=logger,
+        default_root_dir=root_dir,
+        callbacks=[online_finetuner],
+        accelerator=config.training.accelerator,
+        devices=config.training.devices,
+        max_epochs=args.ssl_max_epochs,
+        gradient_clip_val=config.training.gradient_clip_val,
+        num_sanity_val_steps=2,
+        log_every_n_steps=10,
+    )
+
+    trainer.fit(model, train_loader, val_dataloaders=[val_loader])
+
+
+if __name__ == "__main__":
+    main()
