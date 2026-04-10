@@ -301,7 +301,11 @@ def build_dataloaders(dfs: dict, meta_df: pl.DataFrame, config):
             df.select(["mz_array", "intensity_array", "genus_class"]),
             batch_size=256,
         )
-        return LanceMapDataset(str(stream.path), seq_len=seq_len)
+        dataset = LanceMapDataset(str(stream.path), seq_len=seq_len)
+        # Prevent the SpectrumDataset (and its temp Lance DB) from being
+        # garbage-collected while the LanceMapDataset still needs the files.
+        dataset._spectrum_dataset_ref = stream
+        return dataset
 
     train_dataset = _make_ssl_dataset(["train"])
     val_dataset = _make_ssl_dataset(["probe_train", "probe_val"])
