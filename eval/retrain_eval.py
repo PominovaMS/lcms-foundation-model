@@ -34,7 +34,13 @@ from source.config import (
     TrainingConfig,
 )
 from callbacks import FineTuner
-from data import load_metadata, load_mzml_data, assign_splits, build_dataloaders
+from data import (
+    load_metadata,
+    load_mzml_data,
+    assign_splits,
+    get_needed_files,
+    build_dataloaders,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -100,13 +106,13 @@ def main():
         meta_df, n_probe_genera=args.n_probe_genera, n_ssl_top=args.n_ssl_top
     )
 
-    # Load mzML files
-    peak_files = meta_df["peak_file"].to_list()
+    # Only load files that will actually be used
+    peak_files = get_needed_files(meta_df, args.data_dir, n_ssl_files=args.n_ssl_files)
     dfs = load_mzml_data(args.data_dir, peak_files, config.data.max_num_peaks)
 
     # Build DataLoaders
     train_loader, val_loader, probe_train_loader, probe_val_loader = build_dataloaders(
-        dfs, meta_df, config, n_ssl_files=args.n_ssl_files
+        dfs, meta_df, config
     )
     logging.info(f"SSL batches — train: {len(train_loader)}, val: {len(val_loader)}")
     logging.info(

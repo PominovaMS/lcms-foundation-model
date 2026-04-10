@@ -199,6 +199,65 @@ def load_mzml_data(data_dir: str, peak_files: list[str], max_num_peaks: int) -> 
     return dfs
 
 
+def get_needed_files(
+    meta_df: pl.DataFrame, data_dir: str, n_ssl_files: int | None = None
+) -> list[str]:
+    """
+    Return only the peak_files that will actually be used, so only these
+    need to be loaded from disk.
+
+    1. Checks which metadata files exist in data_dir (logs missing ones).
+    2. Selects all existing probe files (always needed).
+    3. Selects existing SSL train files, capped to n_ssl_files if set
+       (deterministic: sorted alphabetically).
+    4. Returns the union.
+    """
+    all_files = meta_df["peak_file"].to_list()
+    existing = set()
+    missing = []
+    for f in all_files:
+        if os.path.exists(os.path.join(data_dir, f)):
+            existing.add(f)
+        else:
+            missing.append(f)
+
+    if missing:
+        logger.warning(
+            f"{len(missing)}/{len(all_files)} mzML files not found in {data_dir}:"
+        )
+        for f in missing:
+            logger.warning(f"  missing: {f}")
+
+    # Probe files — always needed (skip missing)
+    probe_files = [
+        f
+        for f in meta_df.filter(pl.col("split").is_in(["probe_train", "probe_val"]))[
+            "peak_file"
+        ].to_list()
+        if f in existing
+    ]
+
+    # SSL train files — cap after filtering to existing
+    ssl_files = [
+        f
+        for f in meta_df.filter(pl.col("split") == "train")["peak_file"].to_list()
+        if f in existing
+    ]
+    if n_ssl_files is not None and len(ssl_files) > n_ssl_files:
+        ssl_files = sorted(ssl_files)[:n_ssl_files]
+        logger.info(
+            f"SSL train capped to {n_ssl_files} files "
+            f"(of {len(meta_df.filter(pl.col('split') == 'train'))} in metadata)"
+        )
+
+    needed = sorted(set(probe_files) | set(ssl_files))
+    logger.info(
+        f"Files to load: {len(needed)} "
+        f"({len(ssl_files)} SSL train + {len(probe_files)} probe)"
+    )
+    return needed
+
+
 def run_collate_fn(rows):
     """Collate function for RunDataset: keeps mz/intensity as lists of tensors."""
     keys = rows[0].keys()
@@ -211,15 +270,12 @@ def run_collate_fn(rows):
     return batch
 
 
-def build_dataloaders(
-    dfs: dict, meta_df: pl.DataFrame, config, n_ssl_files: int | None = None
-):
+def build_dataloaders(dfs: dict, meta_df: pl.DataFrame, config):
     """
     Build all four DataLoaders for an eval experiment.
 
-    Filters meta_df to only files present in dfs (handles missing mzMLs).
-    If n_ssl_files is set, caps the SSL training set to that many files
-    (deterministic: sorted alphabetically by filename).
+    Filters meta_df to only files present in dfs. File selection and SSL
+    capping should be done upstream via get_needed_files().
 
     Returns:
         train_loader       – SSL pretraining (spectra-level, shuffled)
@@ -235,16 +291,10 @@ def build_dataloaders(
     meta_df = meta_df.filter(pl.col("peak_file").is_in(loaded_files))
 
     # --- SSL datasets (spectrum-level, stored in Lance) ---
-    def _make_ssl_dataset(split_names, max_files=None):
+    def _make_ssl_dataset(split_names):
         files = meta_df.filter(pl.col("split").is_in(split_names))[
             "peak_file"
         ].to_list()
-        if max_files is not None and len(files) > max_files:
-            # Deterministic cap: sort alphabetically, take first N
-            files = sorted(files)[:max_files]
-            logger.info(
-                f"SSL train capped to {max_files}/{len(meta_df.filter(pl.col('split').is_in(split_names)))} files"
-            )
         df = pl.concat([dfs[f] for f in files], how="vertical")
         df = df.join(meta_df, on="peak_file", how="left")
         stream = SpectrumDataset(
@@ -253,7 +303,7 @@ def build_dataloaders(
         )
         return LanceMapDataset(str(stream.path), seq_len=seq_len)
 
-    train_dataset = _make_ssl_dataset(["train"], max_files=n_ssl_files)
+    train_dataset = _make_ssl_dataset(["train"])
     val_dataset = _make_ssl_dataset(["probe_train", "probe_val"])
 
     train_loader = DataLoader(
