@@ -64,23 +64,23 @@ dfs = [
         custom_fields=None,
         progress=True,
     )
-    for mzml_file in os.listdir(train_data_dir)[:1]
+    for mzml_file in os.listdir(train_data_dir)
 ]
 train_df = pl.concat(dfs, how="vertical")
 
-# dfs = [
-#     spectra_to_df(
-#         os.path.join(val_data_dir, mzml_file),
-#         metadata_df=None,
-#         ms_level=1,
-#         preprocessing_fn=preprocessing_fn,
-#         valid_charge=None,
-#         custom_fields=None,
-#         progress=True,
-#     )
-#     for mzml_file in os.listdir(val_data_dir)
-# ]
-val_df = pl.concat(dfs, how="vertical")
+val_dfs = [
+    spectra_to_df(
+        os.path.join(val_data_dir, mzml_file),
+        metadata_df=None,
+        ms_level=1,
+        preprocessing_fn=preprocessing_fn,
+        valid_charge=None,
+        custom_fields=None,
+        progress=True,
+    )
+    for mzml_file in os.listdir(val_data_dir)
+]
+val_df = pl.concat(val_dfs, how="vertical")
 
 train_dataset = SpectrumDataset(train_df, batch_size=2)
 val_dataset = SpectrumDataset(val_df, batch_size=2)
