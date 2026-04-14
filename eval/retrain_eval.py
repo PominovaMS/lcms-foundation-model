@@ -96,6 +96,12 @@ def main():
         help="Retrain and evaluate probe every N SSL epochs (default: 1)",
     )
     parser.add_argument("--ssl_max_epochs", type=int, default=500)
+    parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=None,
+        help="Stop if val_loss doesn't improve for N epochs (default: disabled)",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -158,10 +164,20 @@ def main():
         eval_every_n_epochs=args.probe_eval_every,
     )
 
+    callbacks = [retrain_finetuner]
+    if args.early_stopping_patience is not None:
+        callbacks.append(
+            L.callbacks.EarlyStopping(
+                monitor="val_loss",
+                patience=args.early_stopping_patience,
+                mode="min",
+            )
+        )
+
     trainer = L.Trainer(
         logger=logger,
         default_root_dir=root_dir,
-        callbacks=[retrain_finetuner],
+        callbacks=callbacks,
         accelerator=config.training.accelerator,
         devices=config.training.devices,
         max_epochs=args.ssl_max_epochs,
