@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd  # DEBUG
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchmetrics
 import pytorch_lightning as L
 from depthcharge.encoders import PeakEncoder, PositionalEncoder
@@ -26,9 +27,12 @@ class MS1Encoder(L.LightningModule):
         bin_mz_max=2000,
         masked_peaks_fraction=0.3,
         mask_proportional=True,
+        mz_label_sigma=0.0,
         lr=5e-4,
         warmup_iters=1000,
         cosine_schedule_period_iters=32000,
+        optimizer_type="adam",
+        weight_decay=0.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -44,6 +48,7 @@ class MS1Encoder(L.LightningModule):
         self.bin_mz_max = bin_mz_max
         self.masked_peaks_fraction = masked_peaks_fraction
         self.mask_proportional = mask_proportional
+        self.mz_label_sigma = mz_label_sigma
 
         # peak_encoder (that is passed to the SpectrumTransformerEncoder)
         # changed to also apply (add) positional encodings
@@ -136,6 +141,26 @@ class MS1Encoder(L.LightningModule):
         mz_binned[mz < self.bin_mz_min] = -1
         return mz_binned
 
+    def get_soft_targets(self, target_mz_bins):
+        """Create Gaussian soft target distributions centered on true bins."""
+        bins = torch.arange(self.n_bins, device=target_mz_bins.device, dtype=torch.float)
+        centers = target_mz_bins.float().unsqueeze(-1)  # (N, 1)
+        soft = torch.exp(-((bins - centers) ** 2) / (2 * self.mz_label_sigma**2))
+        soft = soft / soft.sum(dim=-1, keepdim=True)
+        return soft
+
+    def compute_mz_loss(self, pred_mz_bins, target_mz_bins):
+        """Compute m/z loss using either hard or soft targets."""
+        if self.mz_label_sigma > 0:
+            valid = target_mz_bins != -1
+            if valid.sum() == 0:
+                return torch.tensor(0.0, device=pred_mz_bins.device)
+            soft_targets = self.get_soft_targets(target_mz_bins[valid])
+            log_probs = F.log_softmax(pred_mz_bins[valid], dim=-1)
+            return -(soft_targets * log_probs).sum(dim=-1).mean()
+        else:
+            return self.loss_mz_bin(pred_mz_bins, target_mz_bins)
+
     def forward(
         self,
         mzs: torch.Tensor,
@@ -175,7 +200,7 @@ class MS1Encoder(L.LightningModule):
         pred_mz_bins = self.head_mz(masked_peak_embs)
         pred_I = self.head_I(masked_peak_embs).squeeze(dim=-1)
 
-        loss_mz_bin = self.loss_mz_bin(pred_mz_bins, target_mz_bins)
+        loss_mz_bin = self.compute_mz_loss(pred_mz_bins, target_mz_bins)
         loss_I = self.loss_I(pred_I, target_I)
         loss = loss_mz_bin  # + loss_I
         self.log("train_loss_mz_bin", loss_mz_bin.item())
@@ -226,7 +251,7 @@ class MS1Encoder(L.LightningModule):
         pred_mz_bins = self.head_mz(masked_peak_embs)
         pred_I = self.head_I(masked_peak_embs).squeeze(dim=-1)
 
-        loss_mz_bin = self.loss_mz_bin(pred_mz_bins, target_mz_bins)
+        loss_mz_bin = self.compute_mz_loss(pred_mz_bins, target_mz_bins)
         # loss_I = self.loss_I(pred_I, target_I)
         loss = loss_mz_bin  # + loss_I
         self.log("val_loss_mz_bin", loss_mz_bin.item())
@@ -286,9 +311,17 @@ class MS1Encoder(L.LightningModule):
         self,
     ):
         """TODO."""
-        optimizer = torch.optim.Adam(
-            self.parameters(), lr=self.hparams.lr, betas=(0.9, 0.98)
-        )
+        if self.hparams.optimizer_type == "adamw":
+            optimizer = torch.optim.AdamW(
+                self.parameters(),
+                lr=self.hparams.lr,
+                betas=(0.9, 0.98),
+                weight_decay=self.hparams.weight_decay,
+            )
+        else:
+            optimizer = torch.optim.Adam(
+                self.parameters(), lr=self.hparams.lr, betas=(0.9, 0.98)
+            )
         self.lr_scheduler = CosineWarmupScheduler(
             optimizer,
             self.hparams.warmup_iters,

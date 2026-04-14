@@ -111,9 +111,12 @@ model = MS1Encoder(
     bin_mz_min=config.model.bin_mz_min,
     bin_mz_max=config.model.bin_mz_max,
     masked_peaks_fraction=config.model.masked_peaks_fraction,
+    mz_label_sigma=config.model.mz_label_sigma,
     lr=config.optimizer.lr,
     warmup_iters=config.optimizer.warmup_iters,
     cosine_schedule_period_iters=config.optimizer.cosine_schedule_period_iters,
+    optimizer_type=config.optimizer.optimizer_type,
+    weight_decay=config.optimizer.weight_decay,
 )
 
 trainer = L.Trainer(

@@ -21,6 +21,7 @@ class ModelConfig:
     bin_mz_min: int
     bin_mz_max: int
     masked_peaks_fraction: float
+    mz_label_sigma: float
 
 
 @dataclass
@@ -28,6 +29,8 @@ class OptimizerConfig:
     lr: float
     warmup_iters: int
     cosine_schedule_period_iters: int
+    optimizer_type: str
+    weight_decay: float
 
 
 @dataclass

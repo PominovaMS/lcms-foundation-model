@@ -21,12 +21,15 @@ model:
   bin_mz_min: 300
   bin_mz_max: 1500
   masked_peaks_fraction: 0.3
+  mz_label_sigma: 0.0
   
 # Optimizer settings
 optimizer:
   lr: 0.0005 # 0.0003
   warmup_iters: 1000
   cosine_schedule_period_iters: 64000 # 32000
+  optimizer_type: "adam"
+  weight_decay: 0.0
 
 # Training settings
 training:
