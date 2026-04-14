@@ -92,7 +92,7 @@ class MS1Encoder(L.LightningModule):
         self.train_mae_I = torchmetrics.regression.MeanAbsoluteError()
         self.val_mae_I = torchmetrics.regression.MeanAbsoluteError()
 
-    def get_peaks_mask(self, intensities, proportional=False):
+    def get_peaks_mask(self, intensities, proportional=False, generator=None):
         if proportional:
             k = int(intensities.size(1) * self.masked_peaks_fraction)
             mask = torch.zeros_like(intensities, dtype=torch.bool)
@@ -106,13 +106,23 @@ class MS1Encoder(L.LightningModule):
                 intensities + (intensities == 0).float() * I_mean[:, None]
             )  # weight 0s by mean I
             # sample k indices without replacement, weighted by w
-            idx = torch.multinomial(w, num_samples=k, replacement=False)
+            idx = torch.multinomial(
+                w, num_samples=k, replacement=False, generator=generator
+            )
             mask = mask.scatter(
                 dim=1, index=idx.to(dtype=torch.int64), value=True
             )  # value to write into mask (True)
 
         else:
-            mask = torch.rand_like(intensities) < self.masked_peaks_fraction
+            mask = (
+                torch.rand(
+                    intensities.shape,
+                    device=intensities.device,
+                    dtype=intensities.dtype,
+                    generator=generator,
+                )
+                < self.masked_peaks_fraction
+            )
         return mask
 
     def get_mz_bins(self, mz):
@@ -186,13 +196,17 @@ class MS1Encoder(L.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        # Note: validation is now always partially random (mask sampling)
-        # so not identical between epochs. May want to change it (how?).
+        # Seed mask sampling for deterministic validation across epochs
+        # (each batch gets a different but reproducible mask)
         mz = batch["mz_array"]
         I = batch["intensity_array"]
 
         # sample peak masks
-        masks = self.get_peaks_mask(I, proportional=self.mask_proportional)
+        generator = torch.Generator(device=I.device)
+        generator.manual_seed(42 + batch_idx)
+        masks = self.get_peaks_mask(
+            I, proportional=self.mask_proportional, generator=generator
+        )
 
         # prepare targets (bins & I of masked peaks)
         target_mz, target_I = mz[masks], I[masks]
