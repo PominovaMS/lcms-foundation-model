@@ -57,9 +57,9 @@ class FineTuner(L.Callback):
     def _encode_run(self, pl_module, run_mz, run_I):
         run_mz, run_I = run_mz.to(pl_module.device), run_I.to(pl_module.device)
         with torch.no_grad():
-            peak_embs = pl_module.forward(run_mz, run_I)
-            spec_embs = peak_embs.mean(dim=1)
-            spec_embs = spec_embs.unsqueeze(dim=0)  # (1, T, d)
+            cls_emb, _ = pl_module.forward(run_mz, run_I)
+            # cls_emb: (n_spectra, d_model) — one CLS per spectrum
+            spec_embs = cls_emb.unsqueeze(dim=0)  # (1, n_spectra, d)
             run_emb = spec_embs.mean(dim=1)  # (1, d)
         return run_emb
 
@@ -220,9 +220,9 @@ class OnlineFineTuner(L.Callback):
     def _encode_run(self, pl_module, run_mz, run_I):
         run_mz, run_I = run_mz.to(pl_module.device), run_I.to(pl_module.device)
         with torch.no_grad():
-            peak_embs = pl_module.forward(run_mz, run_I)
-            spec_embs = peak_embs.mean(dim=1)
-            spec_embs = spec_embs.unsqueeze(dim=0)  # (1, T, d)
+            cls_emb, _ = pl_module.forward(run_mz, run_I)
+            # cls_emb: (n_spectra, d_model) — one CLS per spectrum
+            spec_embs = cls_emb.unsqueeze(dim=0)  # (1, n_spectra, d)
             if self.agg_type == "mean":
                 run_emb = spec_embs.mean(dim=1)  # (1, d)
         return run_emb

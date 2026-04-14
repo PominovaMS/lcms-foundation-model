@@ -32,9 +32,10 @@ def test_peaks_mask(batch):
 def test_forward(batch):
     """Test peaks encoding."""
     model = MS1Encoder(d_model=8, nhead=1, dim_feedforward=12, n_layers=1)
-    peak_embs = model.forward(
+    cls_emb, peak_embs = model.forward(
         mzs=batch["mz_array"], intensities=batch["intensity_array"]
     )
+    assert cls_emb.shape == (2, model.d_model)
     assert peak_embs.shape == (2, 3, model.d_model)
 
 

@@ -166,10 +166,10 @@ class MS1Encoder(L.LightningModule):
         mzs: torch.Tensor,
         intensities: torch.Tensor,
     ):
-        peak_embs, _ = self.encoder(mz_array=mzs, intensity_array=intensities)
-        # drop global token
-        peak_embs = peak_embs[:, 1:, :]
-        return peak_embs
+        embs, _ = self.encoder(mz_array=mzs, intensity_array=intensities)
+        cls_emb = embs[:, 0, :]    # (batch, d_model) — spectrum-level embedding
+        peak_embs = embs[:, 1:, :]  # (batch, n_peaks, d_model)
+        return cls_emb, peak_embs
 
     # def ssl_step(self):
     #     # TODO: move here the repeated part of training & validation parts
@@ -192,8 +192,7 @@ class MS1Encoder(L.LightningModule):
         # masked_I = I * (1 - masks.float()) # FIX: not mask intensities, only mz
 
         # get embeddings for all peaks
-        # peak_embs = self.forward(masked_mz, masked_I)
-        peak_embs = self.forward(masked_mz, I)  # FIX: not mask intensities, only mz
+        _cls_emb, peak_embs = self.forward(masked_mz, I)
         # select only embeddings of masked peaks
         masked_peak_embs = peak_embs[masks]
         # predict masked peaks binned mz & I
@@ -243,8 +242,7 @@ class MS1Encoder(L.LightningModule):
         # masked_I = I * (1 - masks.float()) # FIX: not mask intensities, only mz
 
         # get embeddings for all peaks
-        # peak_embs = self.forward(masked_mz, masked_I)
-        peak_embs = self.forward(masked_mz, I)  # FIX: not mask intensities, only mz
+        _cls_emb, peak_embs = self.forward(masked_mz, I)
         # select only embeddings of masked peaks
         masked_peak_embs = peak_embs[masks]
         # predict masked peaks binned mz & I
