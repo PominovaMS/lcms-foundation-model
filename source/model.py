@@ -45,8 +45,6 @@ class MS1Encoder(L.LightningModule):
         self.masked_peaks_fraction = masked_peaks_fraction
         self.mask_proportional = mask_proportional
 
-        # peak_encoder (that is passed to the SpectrumTransformerEncoder)
-        # changed to also apply (add) positional encodings
         self.peak_encoder = nn.Sequential(
             PeakEncoder(
                 d_model=self.d_model,
@@ -56,17 +54,11 @@ class MS1Encoder(L.LightningModule):
                 max_intensity_wavelength=1,
                 learnable_wavelengths=False,
             ),
-            # PositionalEncoder(
-            #     d_model=self.d_model,
-            #     min_wavelength=1,
-            #     max_wavelength=10000,
-            # ),
         )
-
         self.encoder = SpectrumTransformerEncoder(
             d_model=self.d_model,
             nhead=self.nhead,
-            dim_feedforward=self.dim_feedforward,  # 1024,
+            dim_feedforward=self.dim_feedforward,
             n_layers=self.n_layers,
             dropout=self.dropout,
             peak_encoder=self.peak_encoder,
@@ -244,42 +236,6 @@ class MS1Encoder(L.LightningModule):
         # MAE metric for intensity prediction
         # mae_I = self.val_mae_I(pred_I, target_I)
         # self.log("val_mae_I", mae_I.item(), prog_bar=True, on_step=False, on_epoch=True)
-
-        # DEBUG outputs
-        # i = 0
-        # mz_i, I_i = mz[i], I[i]
-        # mask_i = masks[i]
-        # target_mz_i, target_I_i = mz_i[masks_i], I_i[masks_i]
-        # target_mz_bins = self.get_mz_bins(target_mz)
-
-        n = 30
-        mz_bins_true, I_true = (
-            target_mz_bins[:n].cpu().numpy(),
-            target_I[:n].cpu().numpy(),
-        )
-        mz_bins_pred, I_pred = (
-            pred_mz_bins[:n].argmax(dim=1).cpu().numpy(),
-            pred_I[:n].cpu().numpy(),
-        )
-        sample_df = np.column_stack(
-            (
-                mz_bins_true.ravel(),
-                I_true.ravel(),
-                mz_bins_pred.ravel(),
-                # I_pred.ravel()
-            )
-        )
-        sample_df = pd.DataFrame(
-            sample_df,
-            columns=[
-                "mz_bins_true",
-                "I_true",
-                "mz_bins_pred",
-                # "I_pred"
-            ],
-        )
-        print(sample_df.to_string())
-
         return loss
 
     def configure_optimizers(
