@@ -213,6 +213,9 @@ data/
 # Experiment logs
 source/train_checkpoints/
 
-# Claude
+# Dev notebooks
+notebooks/dev/
+
+# Claude files
 CLAUDE.md
 .claude/
