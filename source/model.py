@@ -12,7 +12,6 @@ from .scheduler import CosineWarmupScheduler
 # pd.set_option('display.max_rows', 500) # DEBUG
 
 
-# <01/01/26 TODO: update model
 class MS1Encoder(L.LightningModule):
     def __init__(
         self,
@@ -67,13 +66,9 @@ class MS1Encoder(L.LightningModule):
         self.head_mz = nn.Sequential(
             nn.Linear(d_model, n_bins),
         )  # outputs n_bins logits for each peak
-        self.head_I = nn.Sequential(
-            nn.Linear(d_model, 1),
-        )  # outputs float I value for each peak
 
         # losses
         self.loss_mz_bin = nn.CrossEntropyLoss(reduction="mean", ignore_index=-1)
-        self.loss_I = nn.MSELoss(reduction="mean")
         # metrics
         self.train_accuracy_mz_bin = torchmetrics.classification.Accuracy(
             task="multiclass", num_classes=self.n_bins, ignore_index=-1
@@ -81,8 +76,6 @@ class MS1Encoder(L.LightningModule):
         self.val_accuracy_mz_bin = torchmetrics.classification.Accuracy(
             task="multiclass", num_classes=self.n_bins, ignore_index=-1
         )
-        self.train_mae_I = torchmetrics.regression.MeanAbsoluteError()
-        self.val_mae_I = torchmetrics.regression.MeanAbsoluteError()
 
     def get_peaks_mask(self, intensities, proportional=False, generator=None):
         if proportional:
@@ -149,29 +142,24 @@ class MS1Encoder(L.LightningModule):
         # sample peak masks
         masks = self.get_peaks_mask(I, proportional=self.mask_proportional)
 
-        # prepare targets (bins & I of masked peaks)
-        target_mz, target_I = mz[masks], I[masks]
+        # prepare targets (mz bins of masked peaks)
+        target_mz = mz[masks]
         # transform mz into bins (target classes C \in [0, n_bins - 1])
         target_mz_bins = self.get_mz_bins(target_mz)
 
         # mask input peaks with 0 (before encoding)
-        masked_mz = mz * (1 - masks.float())
-        # masked_I = I * (1 - masks.float()) # FIX: not mask intensities, only mz
+        masked_mz = mz * (1 - masks.float()) # only mask mz, not intensities
 
         # get embeddings for all peaks
-        # peak_embs = self.forward(masked_mz, masked_I)
-        peak_embs = self.forward(masked_mz, I)  # FIX: not mask intensities, only mz
+        peak_embs = self.forward(masked_mz, I)
         # select only embeddings of masked peaks
         masked_peak_embs = peak_embs[masks]
-        # predict masked peaks binned mz & I
+        # predict masked peaks binned mz
         pred_mz_bins = self.head_mz(masked_peak_embs)
-        pred_I = self.head_I(masked_peak_embs).squeeze(dim=-1)
 
         loss_mz_bin = self.loss_mz_bin(pred_mz_bins, target_mz_bins)
-        loss_I = self.loss_I(pred_I, target_I)
-        loss = loss_mz_bin  # + loss_I
+        loss = loss_mz_bin
         self.log("train_loss_mz_bin", loss_mz_bin.item())
-        # self.log("train_loss_I", loss_I.item())
         self.log("train_loss", loss.item())
         # Accuracy metric for mz bin prediction
         acc_mz_bin = self.train_accuracy_mz_bin(pred_mz_bins, target_mz_bins)
@@ -182,9 +170,6 @@ class MS1Encoder(L.LightningModule):
             on_step=True,
             on_epoch=False,
         )
-        # MAE metric for intensity prediction
-        # mae_I = self.train_mae_I(pred_I, target_I)
-        # self.log("train_mae_I", mae_I.item(), prog_bar=True, on_step=True, on_epoch=False)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -201,28 +186,23 @@ class MS1Encoder(L.LightningModule):
         )
 
         # prepare targets (bins & I of masked peaks)
-        target_mz, target_I = mz[masks], I[masks]
+        target_mz = mz[masks]
         # transform mz into bins (target classes C \in [0, n_bins - 1])
         target_mz_bins = self.get_mz_bins(target_mz)
 
         # mask input peaks with 0 (before encoding)
-        masked_mz = mz * (1 - masks.float())
-        # masked_I = I * (1 - masks.float()) # FIX: not mask intensities, only mz
+        masked_mz = mz * (1 - masks.float()) # only mask mz, not intensities
 
         # get embeddings for all peaks
-        # peak_embs = self.forward(masked_mz, masked_I)
-        peak_embs = self.forward(masked_mz, I)  # FIX: not mask intensities, only mz
+        peak_embs = self.forward(masked_mz, I)
         # select only embeddings of masked peaks
         masked_peak_embs = peak_embs[masks]
-        # predict masked peaks binned mz & I
+        # predict masked peaks binned mz
         pred_mz_bins = self.head_mz(masked_peak_embs)
-        pred_I = self.head_I(masked_peak_embs).squeeze(dim=-1)
 
         loss_mz_bin = self.loss_mz_bin(pred_mz_bins, target_mz_bins)
-        # loss_I = self.loss_I(pred_I, target_I)
-        loss = loss_mz_bin  # + loss_I
+        loss = loss_mz_bin
         self.log("val_loss_mz_bin", loss_mz_bin.item())
-        # self.log("val_loss_I", loss_I.item())
         self.log("val_loss", loss.item())
         # Accuracy metric for mz bin prediction
         acc_mz_bin = self.val_accuracy_mz_bin(pred_mz_bins, target_mz_bins)
@@ -233,9 +213,6 @@ class MS1Encoder(L.LightningModule):
             on_step=False,
             on_epoch=True,
         )
-        # MAE metric for intensity prediction
-        # mae_I = self.val_mae_I(pred_I, target_I)
-        # self.log("val_mae_I", mae_I.item(), prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
     def configure_optimizers(
