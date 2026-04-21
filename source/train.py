@@ -36,10 +36,15 @@ parser.add_argument("--data_dir", required=True, help="The path to the training 
 parser.add_argument(
     "--config", default="../config.yaml", help="Path to configuration file"
 )
+parser.add_argument(
+    "--name", default=None, help="Run name (overrides config.name)"
+)
 args = parser.parse_args()
 
 # Load configuration
 config = load_config(args.config)
+if args.name is not None:
+    config.name = args.name
 
 # Extract configuration values
 BATCH_SIZE = config.data.batch_size
