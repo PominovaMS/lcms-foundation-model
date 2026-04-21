@@ -37,6 +37,7 @@ from callbacks import FineTuner
 from data import (
     load_metadata,
     load_mzml_data,
+    load_parquet_data,
     assign_splits,
     get_needed_files,
     build_dataloaders,
@@ -102,6 +103,28 @@ def main():
         default=None,
         help="Stop if val_loss doesn't improve for N epochs (default: disabled)",
     )
+    parser.add_argument(
+        "--use_cls",
+        action="store_true",
+        help="Use CLS token for spectrum embeddings (default: mean-pool peak embeddings)",
+    )
+    parser.add_argument(
+        "--ssl_genera",
+        nargs="+",
+        default=None,
+        help="Genera for SSL pretraining (e.g., Pseudomonas Bacillus Escherichia)",
+    )
+    parser.add_argument(
+        "--probe_genera",
+        nargs="+",
+        default=None,
+        help="Genera for downstream probe (e.g., Enterococcus Lactococcus)",
+    )
+    parser.add_argument(
+        "--parquet_dir",
+        default=None,
+        help="Path to parquet data dir (if set, load from parquet instead of mzML)",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -109,12 +132,20 @@ def main():
     # Load and split metadata
     meta_df = load_metadata(args.meta_path)
     meta_df = assign_splits(
-        meta_df, n_probe_genera=args.n_probe_genera, n_ssl_top=args.n_ssl_top
+        meta_df, n_probe_genera=args.n_probe_genera, n_ssl_top=args.n_ssl_top,
+        ssl_genera=args.ssl_genera, probe_genera=args.probe_genera,
     )
 
     # Only load files that will actually be used
-    peak_files = get_needed_files(meta_df, args.data_dir, n_ssl_files=args.n_ssl_files)
-    dfs = load_mzml_data(args.data_dir, peak_files, config.data.max_num_peaks)
+    data_dir = args.parquet_dir if args.parquet_dir else args.data_dir
+    data_format = "parquet" if args.parquet_dir else "mzml"
+    peak_files = get_needed_files(
+        meta_df, data_dir, n_ssl_files=args.n_ssl_files, data_format=data_format,
+    )
+    if args.parquet_dir:
+        dfs = load_parquet_data(data_dir, peak_files)
+    else:
+        dfs = load_mzml_data(data_dir, peak_files, config.data.max_num_peaks)
 
     # Build DataLoaders
     train_loader, val_loader, probe_train_loader, probe_val_loader = build_dataloaders(
@@ -162,6 +193,7 @@ def main():
         n_epochs=args.probe_n_epochs,
         min_train_loss=args.probe_min_train_loss,
         eval_every_n_epochs=args.probe_eval_every,
+        use_cls=args.use_cls,
     )
 
     callbacks = [retrain_finetuner]
