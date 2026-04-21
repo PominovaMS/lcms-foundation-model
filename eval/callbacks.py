@@ -30,6 +30,7 @@ class FineTuner(L.Callback):
         n_epochs: int = 10,
         min_train_loss: float = 0.2,
         eval_every_n_epochs: int = 1,
+        use_cls: bool = False,
     ) -> None:
         super().__init__()
 
@@ -44,6 +45,7 @@ class FineTuner(L.Callback):
         self.n_epochs = n_epochs
         self.min_train_loss = min_train_loss
         self.eval_every_n_epochs = eval_every_n_epochs
+        self.use_cls = use_cls
 
         self.probe_train_loader = probe_train_loader
         self.probe_val_loader = probe_val_loader
@@ -57,9 +59,12 @@ class FineTuner(L.Callback):
     def _encode_run(self, pl_module, run_mz, run_I):
         run_mz, run_I = run_mz.to(pl_module.device), run_I.to(pl_module.device)
         with torch.no_grad():
-            cls_emb, _ = pl_module.forward(run_mz, run_I)
-            # cls_emb: (n_spectra, d_model) — one CLS per spectrum
-            spec_embs = cls_emb.unsqueeze(dim=0)  # (1, n_spectra, d)
+            cls_emb, peak_embs = pl_module.forward(run_mz, run_I)
+            if self.use_cls:
+                spec_embs = cls_emb  # (n_spectra, d_model)
+            else:
+                spec_embs = peak_embs.mean(dim=1)  # (n_spectra, d_model)
+            spec_embs = spec_embs.unsqueeze(dim=0)  # (1, n_spectra, d)
             run_emb = spec_embs.mean(dim=1)  # (1, d)
         return run_emb
 
@@ -193,6 +198,7 @@ class OnlineFineTuner(L.Callback):
         agg_type: str = "mean",
         class_weights: Tensor | None = None,
         probe_lr: float = 1e-2,
+        use_cls: bool = False,
     ) -> None:
         super().__init__()
 
@@ -205,6 +211,7 @@ class OnlineFineTuner(L.Callback):
         self.agg_type = agg_type
         self.class_weights = class_weights
         self.probe_lr = probe_lr
+        self.use_cls = use_cls
 
         self.probe_train_loader = probe_train_loader
         self.probe_val_loader = probe_val_loader
@@ -220,9 +227,12 @@ class OnlineFineTuner(L.Callback):
     def _encode_run(self, pl_module, run_mz, run_I):
         run_mz, run_I = run_mz.to(pl_module.device), run_I.to(pl_module.device)
         with torch.no_grad():
-            cls_emb, _ = pl_module.forward(run_mz, run_I)
-            # cls_emb: (n_spectra, d_model) — one CLS per spectrum
-            spec_embs = cls_emb.unsqueeze(dim=0)  # (1, n_spectra, d)
+            cls_emb, peak_embs = pl_module.forward(run_mz, run_I)
+            if self.use_cls:
+                spec_embs = cls_emb  # (n_spectra, d_model)
+            else:
+                spec_embs = peak_embs.mean(dim=1)  # (n_spectra, d_model)
+            spec_embs = spec_embs.unsqueeze(dim=0)  # (1, n_spectra, d)
             if self.agg_type == "mean":
                 run_emb = spec_embs.mean(dim=1)  # (1, d)
         return run_emb
