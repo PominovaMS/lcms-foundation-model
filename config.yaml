@@ -1,5 +1,6 @@
 # Experiment configuration
-name: "ms1-mz-200_peaks-sqrt-clf_run_retrain_sigma1_ffnx4" # ms1 # retrain finetuning
+name: "cli-arg-failed"
+# name: "ms1-mz-200_peaks-sqrt-clf_run_retrain_ffnx4_cls" # removed sigma
 # name: "ms1-mz-200_peaks-sqrt-clf_run_retrain" # ms1 # retrain finetuning
 # name: "ms1-mz-200_peaks-sqrt-clf_run" # ms1 # online finetuning
 # name: "ms1-mz-pos-200_peaks-sqrt" # ms1
@@ -15,15 +16,15 @@ data:
 model:
   d_model: 256
   nhead: 8
-  dim_feedforward: 512
+  dim_feedforward: 1024
   n_layers: 6
   dropout: 0.1
   n_bins: 1200
   bin_mz_min: 300
   bin_mz_max: 1500
   masked_peaks_fraction: 0.3
-  mz_label_sigma: 1.0 # 0.0
-  
+  mz_label_sigma: 0.0 # 1.0
+
 # Optimizer settings
 optimizer:
   lr: 0.0005 # 0.0003
@@ -38,4 +39,4 @@ training:
   max_epochs: 200 # 1000
   gradient_clip_val: 5
   accelerator: "gpu"
-  devices: 2 # 1
+  devices: 1
