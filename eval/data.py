@@ -34,11 +34,18 @@ def assign_splits(
     n_probe_genera: int = 15,
     min_species_per_genus: int = 2,
     n_ssl_top: int = 3,
+    ssl_genera: list[str] | None = None,
+    probe_genera: list[str] | None = None,
 ) -> pl.DataFrame:
     """
     Deterministic split of files into SSL train and probe (train/val).
 
-    Eligible genera (≥ min_species, not "food") are sorted by size (desc).
+    If ssl_genera and probe_genera are provided, use them directly:
+    - ssl_genera → split="train", genus_class=-1
+    - probe_genera → species alternated into probe_train/probe_val
+    - All other genera → split="train", genus_class=-1
+
+    Otherwise, eligible genera (≥ min_species, not "food") are sorted by size (desc).
     - The top n_ssl_top largest → always SSL  (e.g. Pseudomonas, Staphylococcus, Bacillus)
     - The next n_probe_genera → probe (mid-sized, good for classification)
     - Everything else (remaining eligible + ineligible + "food") → SSL
@@ -50,42 +57,50 @@ def assign_splits(
     The split is fully deterministic (no randomness). Ties in genus file count
     are broken alphabetically by genus name.
     """
-    # --- count species & files per genus ---
-    genus_stats = (
-        meta_df.group_by("genus")
-        .agg(
-            pl.col("organism").n_unique().alias("n_species"),
-            pl.len().alias("n_files"),
-        )
-        .sort(["n_files", "genus"], descending=[True, False])
-    )
-
-    # --- eligible = ≥ min_species AND not "food" ---
-    eligible = genus_stats.filter(
-        (pl.col("n_species") >= min_species_per_genus) & (pl.col("genus") != "food")
-    )
-    n_eligible = len(eligible)
-
-    # Clamp n_ssl_top and n_probe_genera to available eligible genera
-    n_ssl_top = min(n_ssl_top, n_eligible)
-    n_probe_genera = min(n_probe_genera, n_eligible - n_ssl_top)
-    if n_probe_genera <= 0:
-        raise ValueError(
-            f"No genera left for probe: {n_eligible} eligible, {n_ssl_top} reserved for SSL top."
+    if ssl_genera is not None and probe_genera is not None:
+        # --- explicit genera mode ---
+        all_genera = set(meta_df["genus"].unique().to_list())
+        all_ssl_genera = all_genera - set(probe_genera)
+        probe_genera = list(probe_genera)  # ensure list
+        n_probe_genera = len(probe_genera)
+    else:
+        # --- automatic size-based ranking ---
+        # --- count species & files per genus ---
+        genus_stats = (
+            meta_df.group_by("genus")
+            .agg(
+                pl.col("organism").n_unique().alias("n_species"),
+                pl.len().alias("n_files"),
+            )
+            .sort(["n_files", "genus"], descending=[True, False])
         )
 
-    # Top n_ssl_top → SSL, next n_probe_genera → probe, rest → SSL
-    ssl_top = set(eligible.head(n_ssl_top)["genus"].to_list())
-    probe_genera = eligible.slice(n_ssl_top, n_probe_genera)["genus"].to_list()
-    ssl_remaining = set(eligible.slice(n_ssl_top + n_probe_genera)["genus"].to_list())
+        # --- eligible = ≥ min_species AND not "food" ---
+        eligible = genus_stats.filter(
+            (pl.col("n_species") >= min_species_per_genus) & (pl.col("genus") != "food")
+        )
+        n_eligible = len(eligible)
 
-    # Ineligible genera (< min_species, or "food") → always SSL
-    ineligible = genus_stats.filter(
-        (pl.col("n_species") < min_species_per_genus) | (pl.col("genus") == "food")
-    )
-    ssl_genera_ineligible = set(ineligible["genus"].to_list())
+        # Clamp n_ssl_top and n_probe_genera to available eligible genera
+        n_ssl_top = min(n_ssl_top, n_eligible)
+        n_probe_genera = min(n_probe_genera, n_eligible - n_ssl_top)
+        if n_probe_genera <= 0:
+            raise ValueError(
+                f"No genera left for probe: {n_eligible} eligible, {n_ssl_top} reserved for SSL top."
+            )
 
-    all_ssl_genera = ssl_top | ssl_remaining | ssl_genera_ineligible
+        # Top n_ssl_top → SSL, next n_probe_genera → probe, rest → SSL
+        ssl_top = set(eligible.head(n_ssl_top)["genus"].to_list())
+        probe_genera = eligible.slice(n_ssl_top, n_probe_genera)["genus"].to_list()
+        ssl_remaining = set(eligible.slice(n_ssl_top + n_probe_genera)["genus"].to_list())
+
+        # Ineligible genera (< min_species, or "food") → always SSL
+        ineligible = genus_stats.filter(
+            (pl.col("n_species") < min_species_per_genus) | (pl.col("genus") == "food")
+        )
+        ssl_genera_ineligible = set(ineligible["genus"].to_list())
+
+        all_ssl_genera = ssl_top | ssl_remaining | ssl_genera_ineligible
 
     # --- assign genus_class (0..n-1 for probe, alphabetical by genus name) ---
     probe_genera_sorted = sorted(probe_genera)
@@ -199,8 +214,36 @@ def load_mzml_data(data_dir: str, peak_files: list[str], max_num_peaks: int) -> 
     return dfs
 
 
+def load_parquet_data(data_dir: str, peak_files: list[str]) -> dict:
+    """
+    Load pre-processed parquet files from data_dir.
+    peak_files have .mzML names (from metadata); maps them to .parquet on disk.
+    Returns dict mapping peak_file (mzML name) → polars DataFrame.
+    """
+    dfs = {}
+    missing = []
+    for peak_file in peak_files:
+        parquet_file = peak_file.replace(".mzML", ".parquet")
+        path = os.path.join(data_dir, parquet_file)
+        if os.path.exists(path):
+            dfs[peak_file] = pl.read_parquet(path)
+        else:
+            missing.append(parquet_file)
+
+    if missing:
+        logger.warning(
+            f"{len(missing)}/{len(peak_files)} parquet files not found in {data_dir}:"
+        )
+        for f in missing:
+            logger.warning(f"  missing: {f}")
+
+    logger.info(f"Loaded {len(dfs)}/{len(peak_files)} parquet files from {data_dir}")
+    return dfs
+
+
 def get_needed_files(
-    meta_df: pl.DataFrame, data_dir: str, n_ssl_files: int | None = None
+    meta_df: pl.DataFrame, data_dir: str, n_ssl_files: int | None = None,
+    data_format: str = "mzml",
 ) -> list[str]:
     """
     Return only the peak_files that will actually be used, so only these
@@ -216,14 +259,18 @@ def get_needed_files(
     existing = set()
     missing = []
     for f in all_files:
-        if os.path.exists(os.path.join(data_dir, f)):
+        if data_format == "parquet":
+            disk_name = f.replace(".mzML", ".parquet")
+        else:
+            disk_name = f
+        if os.path.exists(os.path.join(data_dir, disk_name)):
             existing.add(f)
         else:
-            missing.append(f)
+            missing.append(disk_name)
 
     if missing:
         logger.warning(
-            f"{len(missing)}/{len(all_files)} mzML files not found in {data_dir}:"
+            f"{len(missing)}/{len(all_files)} {data_format} files not found in {data_dir}:"
         )
         for f in missing:
             logger.warning(f"  missing: {f}")
