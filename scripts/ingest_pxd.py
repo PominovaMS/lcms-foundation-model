@@ -96,13 +96,24 @@ def select_files(remote: list[str], glob: str | None, limit: int | None) -> list
 
 
 def download_files(
-    project, names: list[str], raw_dir: Path, manifest: Manifest, force: bool
+    project,
+    names: list[str],
+    raw_dir: Path,
+    mzml_dir: Path,
+    manifest: Manifest,
+    force: bool,
 ) -> list[Path]:
-    """Download the selected files, skipping those already present (ppx + manifest)."""
+    """Download the selected files, skipping those already present (ppx + manifest).
+
+    Files whose mzML already exists on disk are skipped too: their raw is no longer
+    needed, so a run after ``--prune-raw`` never re-downloads a raw we deleted on purpose.
+    """
     todo = []
     for name in names:
         local = raw_dir / os.path.basename(name)
         entry = manifest.get(name)
+        if not force and converted_mzml(name, mzml_dir, manifest):
+            continue
         if not force and entry.get("downloaded") and local.exists():
             continue
         todo.append(name)
@@ -125,9 +136,44 @@ def download_files(
 # --------------------------------------------------------------------------- #
 # Conversion
 # --------------------------------------------------------------------------- #
-def needs_conversion(files: list[Path]) -> bool:
-    """True if any file is a Thermo .raw; False if the collection is already mzML."""
-    return any(f.suffix.lower() in RAW_SUFFIXES for f in files)
+def converted_mzml(name: str, mzml_dir: Path, manifest: Manifest) -> Path | None:
+    """Return the mzML for a remote file if it exists on disk, else ``None``.
+
+    The check is at the *mzML level*: the output file must actually be present and
+    non-empty, not merely flagged ``converted`` in the manifest. This is the safety
+    gate for removing a raw — we only ever delete a .raw whose real output we can see.
+    """
+    entry = manifest.get(name)
+    candidates = []
+    if entry.get("mzml"):
+        candidates.append(Path(entry["mzml"]))
+    stem = os.path.splitext(os.path.basename(name))[0]
+    candidates.append(mzml_dir / (stem + ".mzML"))
+    for p in candidates:
+        if p.exists() and p.stat().st_size > 0:
+            return p
+    return None
+
+
+def prune_raws(
+    raw_dir: Path, mzml_dir: Path, manifest: Manifest, names: list[str]
+) -> int:
+    """Delete .raw files whose converted mzML is verified on disk. Returns count removed.
+
+    Never touches a raw without a real mzML output (see :func:`converted_mzml`), so a
+    failed or partial conversion always keeps its source. Idempotent: a raw already gone
+    is simply skipped. The manifest records ``raw_removed`` so re-runs know why it's absent.
+    """
+    removed = 0
+    for name in names:
+        if not converted_mzml(name, mzml_dir, manifest):
+            continue  # no verified mzML -> keep the raw
+        raw = raw_dir / os.path.basename(name)
+        if raw.exists() and raw.suffix.lower() in RAW_SUFFIXES:
+            raw.unlink()
+            manifest.mark(name, raw_removed=True)
+            removed += 1
+    return removed
 
 
 def convert_one(raw: Path, mzml_dir: Path) -> Path:
@@ -232,6 +278,11 @@ def parse_args(argv=None):
     p.add_argument("--seed", type=int, default=0, help="Seed for the deterministic split")
     p.add_argument("--dry-run", action="store_true", help="List + plan only")
     p.add_argument("--force", action="store_true", help="Ignore manifest, redo everything")
+    p.add_argument(
+        "--prune-raw",
+        action="store_true",
+        help="After conversion, delete .raw files whose mzML is verified on disk",
+    )
     return p.parse_args(argv)
 
 
@@ -266,24 +317,41 @@ def main(argv=None) -> int:
         print("\n(dry run — nothing downloaded or converted)")
         return 0
 
-    downloaded = download_files(project, selected, raw_dir, manifest, args.force)
-    print(f"Downloaded/present: {len(downloaded)} files in {raw_dir}")
+    downloaded = download_files(
+        project, selected, raw_dir, mzml_dir, manifest, args.force
+    )
+    print(f"Downloaded/present: {len(downloaded)} raw/mzML files in {raw_dir}")
 
-    if needs_conversion(downloaded):
-        raws = [f for f in downloaded if f.suffix.lower() in RAW_SUFFIXES]
-        mzml_files = convert_all(raws, mzml_dir, args.jobs, manifest, args.force)
-        # Include any non-raw mzML that shipped alongside.
-        mzml_files += [f for f in downloaded if f.suffix.lower() in MZML_SUFFIXES]
-    else:
-        # Dataset already ships mzML; mirror it into the mzml/ dir via symlink.
-        mzml_dir.mkdir(parents=True, exist_ok=True)
-        mzml_files = []
-        for f in downloaded:
-            if f.suffix.lower() in MZML_SUFFIXES:
-                link = mzml_dir / f.name
-                if not (link.exists() or link.is_symlink()):
-                    os.symlink(f.resolve(), link)
-                mzml_files.append(link)
+    mzml_dir.mkdir(parents=True, exist_ok=True)
+    mzml_files: list[Path] = []
+    have: set[str] = set()
+
+    def _add(path: Path) -> None:
+        if path.name not in have:
+            mzml_files.append(path)
+            have.add(path.name)
+
+    # 1) Convert freshly-downloaded .raw files (writes into mzml_dir).
+    raws = [f for f in downloaded if f.suffix.lower() in RAW_SUFFIXES]
+    for out in convert_all(raws, mzml_dir, args.jobs, manifest, args.force):
+        _add(out)
+
+    # 2) Mirror any mzML that shipped directly: it downloads into raw_dir, so
+    #    symlink it into mzml_dir to keep mzml_dir the single source of truth.
+    for f in downloaded:
+        if f.suffix.lower() in MZML_SUFFIXES:
+            link = mzml_dir / f.name
+            if not (link.exists() or link.is_symlink()):
+                os.symlink(f.resolve(), link)
+            _add(link)
+
+    # 3) Re-attach files converted on an earlier run whose raw may since be pruned
+    #    (they never appear in `downloaded`, but their mzML still lives in mzml_dir).
+    for name in selected:
+        existing = converted_mzml(name, mzml_dir, manifest)
+        if existing:
+            _add(existing)
+
     print(f"mzML ready: {len(mzml_files)} files in {mzml_dir}")
 
     if args.link_into:
@@ -291,6 +359,10 @@ def main(argv=None) -> int:
             mzml_files, Path(args.link_into), args.val_frac, args.seed, args.force
         )
         print(f"Linked into {args.link_into}: {n_train} train, {n_val} val")
+
+    if args.prune_raw:
+        removed = prune_raws(raw_dir, mzml_dir, manifest, selected)
+        print(f"Pruned {removed} raw files (converted mzML verified on disk).")
 
     print("Done.")
     return 0
