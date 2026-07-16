@@ -17,12 +17,14 @@ Prerequisites (see scripts/README.md):
 
 import argparse
 import fnmatch
+import ftplib
 import hashlib
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -78,10 +80,15 @@ class Manifest:
 # --------------------------------------------------------------------------- #
 # Download
 # --------------------------------------------------------------------------- #
-def find_and_list(accession: str, raw_dir: Path):
-    """Resolve the project on ProteomeXchange and list its remote files."""
+def find_and_list(accession: str, raw_dir: Path, timeout: float = 60.0):
+    """Resolve the project on ProteomeXchange and list its remote files.
+
+    ``timeout`` is the per-socket-operation timeout (seconds) handed to ppx's
+    FTP client. ppx defaults to 10s, which trips constantly on large files from
+    slow PRIDE mirrors — bump it well up.
+    """
     raw_dir.mkdir(parents=True, exist_ok=True)
-    project = ppx.find_project(accession, local=str(raw_dir))
+    project = ppx.find_project(accession, local=str(raw_dir), timeout=timeout)
     return project, project.remote_files()
 
 
@@ -95,6 +102,45 @@ def select_files(remote: list[str], glob: str | None, limit: int | None) -> list
     return files
 
 
+def _download_with_resume(
+    project,
+    todo: list[str],
+    force: bool,
+    max_reconnects: int,
+    attempts: int,
+) -> None:
+    """Call ``project.download`` repeatedly, resuming until it completes.
+
+    ppx opens partial downloads in append mode and issues an FTP ``REST``, so a
+    torn-down transfer resumes from the last byte on the next call — both across
+    ppx's internal reconnects and across our outer attempts here. A slow mirror
+    (e.g. a 2.4 GB file at ~25 kb/s) blows past ppx's built-in reconnect budget
+    mid-file and raises ``ftplib.error_temp``; we just call again and it picks up
+    where it left off. Only the first attempt honours ``force`` (a truncating
+    ``wb+`` open) — every retry uses ``force_=False`` so we resume, not restart.
+    """
+    # ppx hardcodes max_reconnects=10 on its FTPParser; reach in and raise it.
+    parser = getattr(project, "_parser", None)
+    if parser is not None and hasattr(parser, "max_reconnects"):
+        parser.max_reconnects = max_reconnects
+
+    for attempt in range(1, attempts + 1):
+        try:
+            # ppx downloads into the project's `local` dir and skips size-matched
+            # files, so completed files are no-ops on subsequent attempts.
+            project.download(todo, force_=force and attempt == 1)
+            return
+        except (ftplib.error_temp, EOFError, OSError) as err:
+            if attempt == attempts:
+                raise
+            print(
+                f"WARNING: download attempt {attempt}/{attempts} failed "
+                f"({type(err).__name__}: {err}); resuming ...",
+                file=sys.stderr,
+            )
+            time.sleep(min(30, 2 ** attempt))
+
+
 def download_files(
     project,
     names: list[str],
@@ -102,6 +148,8 @@ def download_files(
     mzml_dir: Path,
     manifest: Manifest,
     force: bool,
+    max_reconnects: int = 50,
+    attempts: int = 20,
 ) -> list[Path]:
     """Download the selected files, skipping those already present (ppx + manifest).
 
@@ -119,8 +167,7 @@ def download_files(
         todo.append(name)
 
     if todo:
-        # ppx downloads into the project's `local` dir and skips size-matched files.
-        project.download(todo, force_=force)
+        _download_with_resume(project, todo, force, max_reconnects, attempts)
 
     downloaded = []
     for name in names:
@@ -279,6 +326,24 @@ def parse_args(argv=None):
     p.add_argument("--dry-run", action="store_true", help="List + plan only")
     p.add_argument("--force", action="store_true", help="Ignore manifest, redo everything")
     p.add_argument(
+        "--timeout",
+        type=float,
+        default=60.0,
+        help="Per-operation FTP socket timeout in seconds (ppx default is 10)",
+    )
+    p.add_argument(
+        "--max-reconnects",
+        type=int,
+        default=50,
+        help="FTP reconnects ppx attempts mid-file before raising (ppx default is 10)",
+    )
+    p.add_argument(
+        "--download-attempts",
+        type=int,
+        default=20,
+        help="Outer resume attempts if a download still fails after all reconnects",
+    )
+    p.add_argument(
         "--prune-raw",
         action="store_true",
         help="After conversion, delete .raw files whose mzML is verified on disk",
@@ -295,7 +360,7 @@ def main(argv=None) -> int:
     manifest = Manifest.load(collection / "manifest.json")
 
     print(f"Resolving {args.accession} ...")
-    project, remote = find_and_list(args.accession, raw_dir)
+    project, remote = find_and_list(args.accession, raw_dir, args.timeout)
     print(f"{len(remote)} files available on ProteomeXchange.")
 
     selected = select_files(remote, args.glob, args.limit)
@@ -318,7 +383,14 @@ def main(argv=None) -> int:
         return 0
 
     downloaded = download_files(
-        project, selected, raw_dir, mzml_dir, manifest, args.force
+        project,
+        selected,
+        raw_dir,
+        mzml_dir,
+        manifest,
+        args.force,
+        args.max_reconnects,
+        args.download_attempts,
     )
     print(f"Downloaded/present: {len(downloaded)} raw/mzML files in {raw_dir}")
 
