@@ -25,7 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import ppx
@@ -118,6 +118,12 @@ def _download_with_resume(
     mid-file and raises ``ftplib.error_temp``; we just call again and it picks up
     where it left off. Only the first attempt honours ``force`` (a truncating
     ``wb+`` open) — every retry uses ``force_=False`` so we resume, not restart.
+
+    We also catch ``ftplib.error_perm``: PRIDE intermittently answers the ``SIZE``
+    probe (which ppx issues *outside* its own reconnect wrapper, ftp.py:147) with
+    ``550 Could not get file size``. ppx's own ``_with_reconnects`` treats
+    ``error_perm`` as retryable, so mirroring that here is consistent — a genuinely
+    missing file just exhausts ``attempts`` and re-raises as before, only slower.
     """
     # ppx hardcodes max_reconnects=10 on its FTPParser; reach in and raise it.
     parser = getattr(project, "_parser", None)
@@ -130,7 +136,7 @@ def _download_with_resume(
             # files, so completed files are no-ops on subsequent attempts.
             project.download(todo, force_=force and attempt == 1)
             return
-        except (ftplib.error_temp, EOFError, OSError) as err:
+        except (ftplib.error_temp, ftplib.error_perm, EOFError, OSError) as err:
             if attempt == attempts:
                 raise
             print(
@@ -141,43 +147,99 @@ def _download_with_resume(
             time.sleep(min(30, 2 ** attempt))
 
 
-def download_files(
+def stream_ingest(
     project,
     names: list[str],
     raw_dir: Path,
     mzml_dir: Path,
     manifest: Manifest,
     force: bool,
+    jobs: int,
+    prune_raw: bool,
     max_reconnects: int = 50,
     attempts: int = 20,
 ) -> list[Path]:
-    """Download the selected files, skipping those already present (ppx + manifest).
+    """Download, convert, and (optionally) prune each file as a streaming pipeline.
 
-    Files whose mzML already exists on disk are skipped too: their raw is no longer
-    needed, so a run after ``--prune-raw`` never re-downloads a raw we deleted on purpose.
+    Files are downloaded one at a time (ppx uses a single FTP connection), but each
+    raw is handed to a background pool of ``jobs`` converters the instant it lands —
+    so the next download overlaps the running conversions. With ``prune_raw`` each
+    raw is deleted the moment its mzML is verified on disk.
+
+    The point of streaming (vs. download-all-then-convert-all) is failure and disk
+    safety: if a download dies on file N, files 1..N-1 are already converted and
+    pruned rather than lost, and raw disk usage stays bounded to the few in flight
+    instead of holding the whole batch. Fully resumable via the manifest / mzML checks.
     """
-    todo = []
-    for name in names:
-        local = raw_dir / os.path.basename(name)
-        entry = manifest.get(name)
-        if not force and converted_mzml(name, mzml_dir, manifest):
-            continue
-        if not force and entry.get("downloaded") and local.exists():
-            continue
-        todo.append(name)
+    mzml_dir.mkdir(parents=True, exist_ok=True)
+    results: list[Path] = []
+    have: set[str] = set()
 
-    if todo:
-        _download_with_resume(project, todo, force, max_reconnects, attempts)
+    def _add(path: Path) -> None:
+        if path.name not in have:
+            have.add(path.name)
+            results.append(path)
 
-    downloaded = []
-    for name in names:
-        local = raw_dir / os.path.basename(name)
-        if local.exists():
-            manifest.mark(name, downloaded=True, size=local.stat().st_size)
-            downloaded.append(local)
-        else:
-            print(f"WARNING: expected download missing: {local}", file=sys.stderr)
-    return downloaded
+    def _finish(name: str, out: Path) -> None:
+        manifest.mark(name, converted=True, mzml=str(out))
+        _add(out)
+        if prune_raw and converted_mzml(name, mzml_dir, manifest):
+            raw = raw_dir / os.path.basename(name)
+            if raw.exists() and raw.suffix.lower() in RAW_SUFFIXES:
+                raw.unlink()
+                manifest.mark(name, raw_removed=True)
+
+    def _drain(future) -> None:
+        name = pending.pop(future)
+        try:
+            _finish(name, future.result())
+        except Exception as err:  # a bad raw shouldn't sink the whole batch
+            print(f"WARNING: conversion failed for {name}: {err}", file=sys.stderr)
+
+    pending: dict = {}
+    with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+        try:
+            for name in names:
+                # 1) Already converted on an earlier run (raw may be pruned).
+                existing = converted_mzml(name, mzml_dir, manifest) if not force else None
+                if existing:
+                    _add(existing)
+                    continue
+
+                local = raw_dir / os.path.basename(name)
+                entry = manifest.get(name)
+
+                # 2) Download unless the raw is already present on disk.
+                if force or not (entry.get("downloaded") and local.exists()):
+                    _download_with_resume(
+                        project, [name], force, max_reconnects, attempts
+                    )
+                if not local.exists():
+                    print(f"WARNING: expected download missing: {local}", file=sys.stderr)
+                    continue
+                manifest.mark(name, downloaded=True, size=local.stat().st_size)
+
+                # 3) mzML that shipped directly: symlink into mzml_dir, no conversion.
+                if local.suffix.lower() in MZML_SUFFIXES:
+                    link = mzml_dir / local.name
+                    if not (link.exists() or link.is_symlink()):
+                        os.symlink(local.resolve(), link)
+                    _add(link)
+                    continue
+
+                # 4) Raw: convert in the background so the next download overlaps it.
+                pending[pool.submit(convert_one, local, mzml_dir)] = name
+
+                # Reap finished conversions promptly so their raws get pruned now.
+                for future in [f for f in pending if f.done()]:
+                    _drain(future)
+        finally:
+            # Finalize every conversion we started, even if a download raised —
+            # so partial progress is converted + pruned before we report failure.
+            for future in as_completed(list(pending)):
+                _drain(future)
+
+    return results
 
 
 # --------------------------------------------------------------------------- #
@@ -202,27 +264,6 @@ def converted_mzml(name: str, mzml_dir: Path, manifest: Manifest) -> Path | None
     return None
 
 
-def prune_raws(
-    raw_dir: Path, mzml_dir: Path, manifest: Manifest, names: list[str]
-) -> int:
-    """Delete .raw files whose converted mzML is verified on disk. Returns count removed.
-
-    Never touches a raw without a real mzML output (see :func:`converted_mzml`), so a
-    failed or partial conversion always keeps its source. Idempotent: a raw already gone
-    is simply skipped. The manifest records ``raw_removed`` so re-runs know why it's absent.
-    """
-    removed = 0
-    for name in names:
-        if not converted_mzml(name, mzml_dir, manifest):
-            continue  # no verified mzML -> keep the raw
-        raw = raw_dir / os.path.basename(name)
-        if raw.exists() and raw.suffix.lower() in RAW_SUFFIXES:
-            raw.unlink()
-            manifest.mark(name, raw_removed=True)
-            removed += 1
-    return removed
-
-
 def convert_one(raw: Path, mzml_dir: Path) -> Path:
     """Convert a single .raw to indexed mzML with ThermoRawFileParser.
 
@@ -236,39 +277,6 @@ def convert_one(raw: Path, mzml_dir: Path) -> Path:
         check=True,
     )
     return out
-
-
-def convert_all(
-    raws: list[Path], mzml_dir: Path, jobs: int, manifest: Manifest, force: bool
-) -> list[Path]:
-    """Convert every .raw to mzML, skipping already-converted files. Resumable."""
-    # Map local raw path back to its manifest key (remote name).
-    key_by_stem = {
-        os.path.splitext(os.path.basename(name))[0]: name for name in manifest.entries
-    }
-
-    pending = []
-    done = []
-    for raw in raws:
-        out = mzml_dir / (raw.stem + ".mzML")
-        name = key_by_stem.get(raw.stem, raw.name)
-        entry = manifest.get(name)
-        if not force and entry.get("converted") and out.exists():
-            done.append(out)
-            continue
-        pending.append((raw, name))
-
-    def _work(item):
-        raw, name = item
-        out = convert_one(raw, mzml_dir)
-        return name, out
-
-    if pending:
-        with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
-            for name, out in pool.map(_work, pending):
-                manifest.mark(name, converted=True, mzml=str(out))
-                done.append(out)
-    return done
 
 
 # --------------------------------------------------------------------------- #
@@ -382,48 +390,20 @@ def main(argv=None) -> int:
         print("\n(dry run — nothing downloaded or converted)")
         return 0
 
-    downloaded = download_files(
+    # Stream each file through download -> convert -> (prune) so progress survives a
+    # mid-batch download failure and raw disk usage stays bounded.
+    mzml_files = stream_ingest(
         project,
         selected,
         raw_dir,
         mzml_dir,
         manifest,
         args.force,
+        args.jobs,
+        args.prune_raw,
         args.max_reconnects,
         args.download_attempts,
     )
-    print(f"Downloaded/present: {len(downloaded)} raw/mzML files in {raw_dir}")
-
-    mzml_dir.mkdir(parents=True, exist_ok=True)
-    mzml_files: list[Path] = []
-    have: set[str] = set()
-
-    def _add(path: Path) -> None:
-        if path.name not in have:
-            mzml_files.append(path)
-            have.add(path.name)
-
-    # 1) Convert freshly-downloaded .raw files (writes into mzml_dir).
-    raws = [f for f in downloaded if f.suffix.lower() in RAW_SUFFIXES]
-    for out in convert_all(raws, mzml_dir, args.jobs, manifest, args.force):
-        _add(out)
-
-    # 2) Mirror any mzML that shipped directly: it downloads into raw_dir, so
-    #    symlink it into mzml_dir to keep mzml_dir the single source of truth.
-    for f in downloaded:
-        if f.suffix.lower() in MZML_SUFFIXES:
-            link = mzml_dir / f.name
-            if not (link.exists() or link.is_symlink()):
-                os.symlink(f.resolve(), link)
-            _add(link)
-
-    # 3) Re-attach files converted on an earlier run whose raw may since be pruned
-    #    (they never appear in `downloaded`, but their mzML still lives in mzml_dir).
-    for name in selected:
-        existing = converted_mzml(name, mzml_dir, manifest)
-        if existing:
-            _add(existing)
-
     print(f"mzML ready: {len(mzml_files)} files in {mzml_dir}")
 
     if args.link_into:
@@ -431,10 +411,6 @@ def main(argv=None) -> int:
             mzml_files, Path(args.link_into), args.val_frac, args.seed, args.force
         )
         print(f"Linked into {args.link_into}: {n_train} train, {n_val} val")
-
-    if args.prune_raw:
-        removed = prune_raws(raw_dir, mzml_dir, manifest, selected)
-        print(f"Pruned {removed} raw files (converted mzML verified on disk).")
 
     print("Done.")
     return 0
