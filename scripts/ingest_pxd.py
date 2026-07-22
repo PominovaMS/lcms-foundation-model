@@ -92,11 +92,27 @@ def find_and_list(accession: str, raw_dir: Path, timeout: float = 60.0):
     return project, project.remote_files()
 
 
-def select_files(remote: list[str], glob: str | None, limit: int | None) -> list[str]:
-    """Filter remote file names by glob and cap by limit, deterministically."""
+def select_files(
+    remote: list[str],
+    glob: str | None,
+    limit: int | None,
+    reverse: bool = False,
+) -> list[str]:
+    """Filter remote file names by glob and cap by limit, deterministically.
+
+    With ``reverse`` the sorted list is walked from the end *before* ``limit`` is
+    applied, so the capped slice is the last ``limit`` files instead of the first.
+    Running one job forward and one reversed lets two processes ingest opposite
+    ends of the same large dataset concurrently. They only overlap if the dataset
+    has fewer than ``2 * limit`` matching files; in the overlap both jobs would
+    fetch the same files, but the on-disk mzML checks in ``converted_mzml`` make
+    that idempotent (redundant, not corrupting).
+    """
     files = sorted(remote)
     if glob:
         files = [f for f in files if fnmatch.fnmatch(os.path.basename(f), glob)]
+    if reverse:
+        files = list(reversed(files))
     if limit is not None:
         files = files[:limit]
     return files
@@ -323,6 +339,12 @@ def parse_args(argv=None):
     p.add_argument("--glob", default=None, help="fnmatch filter on remote file names")
     p.add_argument("--limit", type=int, default=None, help="Cap number of files")
     p.add_argument(
+        "--reverse",
+        action="store_true",
+        help="Ingest from the end of the sorted file list (pair with a forward "
+        "job to cover a large dataset from both ends concurrently)",
+    )
+    p.add_argument(
         "--all",
         action="store_true",
         help="Opt in to downloading the entire dataset (guardrail for large datasets)",
@@ -371,7 +393,7 @@ def main(argv=None) -> int:
     project, remote = find_and_list(args.accession, raw_dir, args.timeout)
     print(f"{len(remote)} files available on ProteomeXchange.")
 
-    selected = select_files(remote, args.glob, args.limit)
+    selected = select_files(remote, args.glob, args.limit, args.reverse)
 
     # Guardrail: never bulk-download without an explicit narrowing/opt-in flag.
     if not (args.glob or args.limit is not None or args.all):

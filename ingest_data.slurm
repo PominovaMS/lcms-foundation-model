@@ -23,6 +23,11 @@ SEED=0
 JOBS=8                # parallel conversions (keep == --cpus-per-task above)
 PRUNE_RAW=1           # 1 = delete each .raw once its mzML is verified on disk; 0 = keep raws
 
+# Direction through the sorted file list. Default forward; override at submit time
+# with `sbatch --export=ALL,REVERSE=1 ingest_data.slurm` to walk from the end, so a
+# second job can chew the same dataset from the opposite end concurrently.
+REVERSE=${REVERSE:-0} # 0 = first LIMIT files, 1 = last LIMIT files
+
 # FTP robustness for large files on slow PRIDE mirrors (ppx defaults: 10s / 10 reconnects).
 # ppx resumes partial downloads (append + REST), so retries pick up where they left off.
 TIMEOUT=60            # per-operation FTP socket timeout (seconds)
@@ -56,9 +61,10 @@ for acc in "${ACCESSIONS[@]}"; do
           --max-reconnects "$MAX_RECONNECTS"
           --download-attempts "$DOWNLOAD_ATTEMPTS")
     [[ "$PRUNE_RAW" -eq 1 ]] && args+=(--prune-raw)
+    [[ "$REVERSE" -eq 1 ]] && args+=(--reverse)
 
     echo "=========================================================="
-    echo "Ingesting ${acc}"
+    echo "Ingesting ${acc} ($([[ "$REVERSE" -eq 1 ]] && echo reverse || echo forward))"
     echo "=========================================================="
     if ! python scripts/ingest_pxd.py "${args[@]}"; then
         echo "ERROR: ingest failed for ${acc}" >&2
