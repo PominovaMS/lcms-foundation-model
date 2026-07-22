@@ -270,6 +270,58 @@ def run_collate_fn(rows):
     return batch
 
 
+def build_probe_dataloaders(dfs: dict, meta_df: pl.DataFrame, config):
+    """
+    Build only the run-level probe DataLoaders (no SSL datasets).
+
+    Use this for evaluating an already-pretrained checkpoint: it skips the
+    spectrum-level SSL datasets (and their temporary Lance DB), so only the
+    probe_train / probe_val runs need to be loaded from disk.
+
+    Filters meta_df to only files present in dfs.
+
+    Returns:
+        probe_train_loader – run-level probe training (shuffled)
+        probe_val_loader   – run-level probe evaluation
+    """
+    batch_size = config.data.batch_size
+    seq_len = config.data.max_num_peaks
+
+    # filter to files that were actually loaded
+    loaded_files = list(dfs.keys())
+    meta_df = meta_df.filter(pl.col("peak_file").is_in(loaded_files))
+
+    run_labels = dict(zip(meta_df["peak_file"], meta_df["genus_class"]))
+
+    def _make_probe_dataset(split_name):
+        files = meta_df.filter(pl.col("split") == split_name)["peak_file"].to_list()
+        return RunDataset(
+            [dfs[f] for f in files],
+            run_labels=run_labels,
+            seq_len=seq_len,
+        )
+
+    probe_train_dataset = _make_probe_dataset("probe_train")
+    probe_val_dataset = _make_probe_dataset("probe_val")
+
+    probe_train_loader = DataLoader(
+        probe_train_dataset,
+        batch_size=batch_size,
+        num_workers=0,
+        shuffle=True,
+        collate_fn=run_collate_fn,
+    )
+    probe_val_loader = DataLoader(
+        probe_val_dataset,
+        batch_size=batch_size,
+        num_workers=0,
+        shuffle=False,
+        collate_fn=run_collate_fn,
+    )
+
+    return probe_train_loader, probe_val_loader
+
+
 def build_dataloaders(dfs: dict, meta_df: pl.DataFrame, config):
     """
     Build all four DataLoaders for an eval experiment.
@@ -318,32 +370,8 @@ def build_dataloaders(dfs: dict, meta_df: pl.DataFrame, config):
     )
 
     # --- Probe datasets (run-level) ---
-    run_labels = dict(zip(meta_df["peak_file"], meta_df["genus_class"]))
-
-    def _make_probe_dataset(split_name):
-        files = meta_df.filter(pl.col("split") == split_name)["peak_file"].to_list()
-        return RunDataset(
-            [dfs[f] for f in files],
-            run_labels=run_labels,
-            seq_len=seq_len,
-        )
-
-    probe_train_dataset = _make_probe_dataset("probe_train")
-    probe_val_dataset = _make_probe_dataset("probe_val")
-
-    probe_train_loader = DataLoader(
-        probe_train_dataset,
-        batch_size=batch_size,
-        num_workers=0,
-        shuffle=True,
-        collate_fn=run_collate_fn,
-    )
-    probe_val_loader = DataLoader(
-        probe_val_dataset,
-        batch_size=batch_size,
-        num_workers=0,
-        shuffle=False,
-        collate_fn=run_collate_fn,
+    probe_train_loader, probe_val_loader = build_probe_dataloaders(
+        dfs, meta_df, config
     )
 
     return train_loader, val_loader, probe_train_loader, probe_val_loader
