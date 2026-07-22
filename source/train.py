@@ -36,6 +36,12 @@ parser.add_argument("--data_dir", required=True, help="The path to the training 
 parser.add_argument(
     "--config", default="../config.yaml", help="Path to configuration file"
 )
+parser.add_argument(
+    "--run_name",
+    default=None,
+    help="Run name for logs + checkpoints (default: config.name). Use a distinct "
+    "name per training set so stages don't overwrite each other.",
+)
 args = parser.parse_args()
 
 # Load configuration
@@ -44,6 +50,7 @@ config = load_config(args.config)
 # Extract configuration values
 BATCH_SIZE = config.data.batch_size
 CHECKPOINT_PATH = config.training.checkpoint_path
+RUN_NAME = args.run_name or config.name
 
 # Load training data
 train_data_dir = os.path.join(args.data_dir, "train_mzml")
@@ -97,7 +104,18 @@ os.makedirs(root_dir, exist_ok=True)
 
 logger = L.loggers.TensorBoardLogger(
     os.path.join(root_dir, "lightning_logs"),
-    name=config.name,
+    name=RUN_NAME,
+)
+
+# Save checkpoints alongside this run's logs so each training set (stage) gets its
+# own directory. `save_last=True` gives a stable `last.ckpt` to probe downstream.
+checkpoint_callback = L.callbacks.ModelCheckpoint(
+    dirpath=os.path.join(logger.log_dir, "checkpoints"),
+    monitor="val_loss",
+    mode="min",
+    save_top_k=1,
+    save_last=True,
+    filename="{epoch}-{step}-{val_loss:.4f}",
 )
 
 # TODO: set reasonable hyperparameters and move them to constants/config
@@ -120,7 +138,7 @@ trainer = L.Trainer(
     #     resume_from_checkpoint=ckpt_path,
     logger=logger,
     default_root_dir=root_dir,
-    callbacks=[],  # [ModelCheckpoint(save_weights_only=True, mode="max", monitor="val_acc")],
+    callbacks=[checkpoint_callback],
     accelerator=config.training.accelerator,
     devices=config.training.devices,
     max_epochs=config.training.max_epochs,
