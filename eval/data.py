@@ -34,9 +34,15 @@ def assign_splits(
     n_probe_genera: int = 15,
     min_species_per_genus: int = 2,
     n_ssl_top: int = 3,
+    probe_all: bool = False,
 ) -> pl.DataFrame:
     """
     Deterministic split of files into SSL train and probe (train/val).
+
+    With ``probe_all=True`` the probe covers ALL eligible genera (nothing is
+    reserved for SSL); ``n_probe_genera`` and ``n_ssl_top`` are then ignored. Use
+    this when the encoder is pretrained elsewhere (e.g. on PRIDE), so there is no
+    need to hold abele genera out for co-trained SSL.
 
     Eligible genera (≥ min_species, not "food") are sorted by size (desc).
     - The top n_ssl_top largest → always SSL  (e.g. Pseudomonas, Staphylococcus, Bacillus)
@@ -66,18 +72,27 @@ def assign_splits(
     )
     n_eligible = len(eligible)
 
-    # Clamp n_ssl_top and n_probe_genera to available eligible genera
-    n_ssl_top = min(n_ssl_top, n_eligible)
-    n_probe_genera = min(n_probe_genera, n_eligible - n_ssl_top)
-    if n_probe_genera <= 0:
-        raise ValueError(
-            f"No genera left for probe: {n_eligible} eligible, {n_ssl_top} reserved for SSL top."
-        )
+    if probe_all:
+        # Probe on every eligible genus; reserve nothing for SSL.
+        ssl_top = set()
+        probe_genera = eligible["genus"].to_list()
+        ssl_remaining = set()
+        n_probe_genera = len(probe_genera)
+        if n_probe_genera == 0:
+            raise ValueError(f"No eligible genera to probe ({n_eligible} eligible).")
+    else:
+        # Clamp n_ssl_top and n_probe_genera to available eligible genera
+        n_ssl_top = min(n_ssl_top, n_eligible)
+        n_probe_genera = min(n_probe_genera, n_eligible - n_ssl_top)
+        if n_probe_genera <= 0:
+            raise ValueError(
+                f"No genera left for probe: {n_eligible} eligible, {n_ssl_top} reserved for SSL top."
+            )
 
-    # Top n_ssl_top → SSL, next n_probe_genera → probe, rest → SSL
-    ssl_top = set(eligible.head(n_ssl_top)["genus"].to_list())
-    probe_genera = eligible.slice(n_ssl_top, n_probe_genera)["genus"].to_list()
-    ssl_remaining = set(eligible.slice(n_ssl_top + n_probe_genera)["genus"].to_list())
+        # Top n_ssl_top → SSL, next n_probe_genera → probe, rest → SSL
+        ssl_top = set(eligible.head(n_ssl_top)["genus"].to_list())
+        probe_genera = eligible.slice(n_ssl_top, n_probe_genera)["genus"].to_list()
+        ssl_remaining = set(eligible.slice(n_ssl_top + n_probe_genera)["genus"].to_list())
 
     # Ineligible genera (< min_species, or "food") → always SSL
     ineligible = genus_stats.filter(

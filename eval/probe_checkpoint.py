@@ -107,6 +107,13 @@ def main():
     # Split control — keep fixed across stages for a comparable probe split.
     parser.add_argument("--n_probe_genera", type=int, default=15)
     parser.add_argument("--n_ssl_top", type=int, default=3)
+    parser.add_argument(
+        "--probe_all",
+        action="store_true",
+        help="Probe on ALL eligible abele genera instead of the 15 mid-sized ones "
+        "(ignores --n_probe_genera / --n_ssl_top). Richer eval, but slower and not "
+        "comparable to the default 15-genera numbers.",
+    )
     # Probe hyperparameters (match eval/retrain_eval.py defaults).
     parser.add_argument("--probe_lr", type=float, default=1e-2)
     parser.add_argument("--probe_n_epochs", type=int, default=100)
@@ -126,13 +133,26 @@ def main():
     # Load and split metadata (deterministic — same split every run).
     meta_df = load_metadata(args.meta_path)
     meta_df = assign_splits(
-        meta_df, n_probe_genera=args.n_probe_genera, n_ssl_top=args.n_ssl_top
+        meta_df,
+        n_probe_genera=args.n_probe_genera,
+        n_ssl_top=args.n_ssl_top,
+        probe_all=args.probe_all,
     )
 
     # Load ONLY the probe files (skip the abele SSL corpus — not needed here).
+    # NOTE: the "SSL: ... genera" line above is assign_splits' abele-internal split.
+    # Here the encoder was pretrained on PRIDE, so those genus_class=-1 files are
+    # NOT used — only the probe_train/probe_val files below are loaded.
     probe_files = meta_df.filter(
         pl.col("split").is_in(["probe_train", "probe_val"])
     )["peak_file"].to_list()
+    n_probe_genera = meta_df.filter(pl.col("genus_class") >= 0)["genus_class"].n_unique()
+    logger.info(
+        f"Downstream probe: {n_probe_genera} genera / {len(probe_files)} files "
+        f"({'all eligible' if args.probe_all else 'mid-sized subset'}). "
+        f"The abele 'SSL' (genus_class=-1) files above are NOT used — "
+        f"pretraining was on PRIDE."
+    )
     dfs = load_mzml_data(args.data_dir, probe_files, config.data.max_num_peaks)
 
     probe_train_loader, probe_val_loader = build_probe_dataloaders(

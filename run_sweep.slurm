@@ -26,6 +26,7 @@ ABELE_META=/mnt/data/shared/lc_ms_foundation/abele_data/all_abele_metadata.csv
 ACCESSIONS=(PXD014877)
 MAX_EPOCHS=2    # smoke test; raise for the real run
 LIMIT=4         # smoke test: files per accession. Set empty ("") to use all.
+PROBE_ALL=      # empty = probe 15 mid-sized genera. Set to 1 to probe ALL genera (slower).
 
 # Stage = array index, or 1 for a bare submit.
 STAGE_NUM="${SLURM_ARRAY_TASK_ID:-1}"
@@ -51,6 +52,7 @@ mkdir -p "$REPO/results"
 "$ENV/bin/python" eval/probe_checkpoint.py \
     --ckpt_path "$CKPT" --data_dir "$ABELE_MZML" --meta_path "$ABELE_META" \
     --config config.yaml --run_name "$STAGE" \
-    --results_csv "$REPO/results/$STAGE.csv"
+    --results_csv "$REPO/results/$STAGE.csv" \
+    ${PROBE_ALL:+--probe_all}
 
 cat "$REPO/results/$STAGE.csv"
