@@ -6,7 +6,14 @@ import torchmetrics
 import pytorch_lightning as L
 from depthcharge.encoders import PeakEncoder, PositionalEncoder
 from depthcharge.transformers import SpectrumTransformerEncoder
-from .scheduler import CosineWarmupScheduler
+
+# Support both import contexts: as a package (`from source.model import ...`, used
+# by eval/) the relative import works; run as a script (`cd source && python
+# train.py`) there is no parent package, so fall back to the top-level module.
+try:
+    from .scheduler import CosineWarmupScheduler
+except ImportError:
+    from scheduler import CosineWarmupScheduler
 
 # from IPython.display import clear_output # DEBUG
 # pd.set_option('display.max_rows', 500) # DEBUG
