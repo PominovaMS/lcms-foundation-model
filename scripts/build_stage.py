@@ -60,23 +60,36 @@ def link_into_training(
     train_dir.mkdir(parents=True, exist_ok=True)
     val_dir.mkdir(parents=True, exist_ok=True)
 
-    n_train = n_val = 0
-    for mzml in mzml_files:
-        is_v = is_val(mzml.name, val_frac, seed)
-        link = (val_dir if is_v else train_dir) / mzml.name
-        if link.is_symlink() or link.exists():
-            if force:
+    # Partition by the stable per-file hash, then guarantee both splits are
+    # non-empty when there are >=2 files. Training reads every file in each dir and
+    # concatenates, which errors on an empty split — this matters for tiny stages
+    # (e.g. a smoke test) but never fires for real stages with many files.
+    val_files = [m for m in mzml_files if is_val(m.name, val_frac, seed)]
+    train_files = [m for m in mzml_files if not is_val(m.name, val_frac, seed)]
+    if len(mzml_files) >= 2:
+        if not val_files:
+            val_files.append(train_files.pop())
+        elif not train_files:
+            train_files.append(val_files.pop())
+
+    for split_dir, files in ((train_dir, train_files), (val_dir, val_files)):
+        for mzml in files:
+            link = split_dir / mzml.name
+            if (link.is_symlink() or link.exists()) and force:
                 link.unlink()
-            # else: leave the existing link in place (idempotent)
-        if not (link.is_symlink() or link.exists()):
-            os.symlink(mzml.resolve(), link)
-        n_val += is_v
-        n_train += not is_v
-    return n_train, n_val
+            if not (link.is_symlink() or link.exists()):
+                os.symlink(mzml.resolve(), link)
+    return len(train_files), len(val_files)
 
 
-def collect_mzml(root: Path, accession: str, mzml_subdir: str) -> list[Path]:
-    """Return the mzML files for one accession, sorted for determinism."""
+def collect_mzml(
+    root: Path, accession: str, mzml_subdir: str, limit: int | None = None
+) -> list[Path]:
+    """Return the mzML files for one accession, sorted for determinism.
+
+    ``limit`` caps the number of files taken per accession (useful for a fast
+    smoke test); ``None`` uses all of them.
+    """
     acc_dir = root / accession / mzml_subdir
     if not acc_dir.is_dir():
         raise FileNotFoundError(
@@ -88,6 +101,8 @@ def collect_mzml(root: Path, accession: str, mzml_subdir: str) -> list[Path]:
     )
     if not files:
         print(f"WARNING: {acc_dir} contains no .mzML files", file=sys.stderr)
+    if limit is not None:
+        files = files[:limit]
     return files
 
 
@@ -119,6 +134,12 @@ def parse_args(argv=None):
     p.add_argument("--val-frac", type=float, default=0.1, help="Fraction held out for val")
     p.add_argument("--seed", type=int, default=0, help="Seed for the deterministic split")
     p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Cap mzML files taken per accession (e.g. a few for a fast smoke test)",
+    )
+    p.add_argument(
         "--mzml-subdir",
         default="mzml",
         help="Per-accession subdirectory holding the mzML files (default: mzml)",
@@ -140,7 +161,7 @@ def build_one_stage(
     """Build a single stage dir from the given accessions and record provenance."""
     mzml_files: list[Path] = []
     for acc in accessions:
-        mzml_files.extend(collect_mzml(root, acc, args.mzml_subdir))
+        mzml_files.extend(collect_mzml(root, acc, args.mzml_subdir, args.limit))
 
     n_train, n_val = link_into_training(
         mzml_files, stage_dir, args.val_frac, args.seed, args.force

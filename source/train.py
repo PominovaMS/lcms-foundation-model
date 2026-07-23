@@ -42,6 +42,19 @@ parser.add_argument(
     help="Run name for logs + checkpoints (default: config.name). Use a distinct "
     "name per training set so stages don't overwrite each other.",
 )
+parser.add_argument(
+    "--max_epochs",
+    type=int,
+    default=None,
+    help="Override config.training.max_epochs (e.g. a small value for a smoke test).",
+)
+parser.add_argument(
+    "--max_steps",
+    type=int,
+    default=None,
+    help="Stop after this many optimizer steps (overrides --max_epochs). Use this to "
+    "train every diversity stage to the SAME number of steps for a fair comparison.",
+)
 args = parser.parse_args()
 
 # Load configuration
@@ -51,6 +64,16 @@ config = load_config(args.config)
 BATCH_SIZE = config.data.batch_size
 CHECKPOINT_PATH = config.training.checkpoint_path
 RUN_NAME = args.run_name or config.name
+# --max_steps takes precedence: cap by steps and leave epochs unlimited (-1) so the
+# step budget is the sole stopping criterion. Otherwise stop on epochs as before.
+if args.max_steps is not None:
+    MAX_STEPS = args.max_steps
+    MAX_EPOCHS = -1
+else:
+    MAX_STEPS = -1
+    MAX_EPOCHS = (
+        args.max_epochs if args.max_epochs is not None else config.training.max_epochs
+    )
 
 # Load training data
 train_data_dir = os.path.join(args.data_dir, "train_mzml")
@@ -107,10 +130,13 @@ logger = L.loggers.TensorBoardLogger(
     name=RUN_NAME,
 )
 
-# Save checkpoints alongside this run's logs so each training set (stage) gets its
-# own directory. `save_last=True` gives a stable `last.ckpt` to probe downstream.
+# Save checkpoints under a deterministic per-run directory (NOT logger.log_dir,
+# which appends a version_N/ subdir) so downstream tooling can find `last.ckpt` at
+# a stable path: <root>/lightning_logs/<run_name>/checkpoints/last.ckpt.
+# `save_last=True` gives that stable file to probe downstream.
+ckpt_dir = os.path.join(root_dir, "lightning_logs", RUN_NAME, "checkpoints")
 checkpoint_callback = L.callbacks.ModelCheckpoint(
-    dirpath=os.path.join(logger.log_dir, "checkpoints"),
+    dirpath=ckpt_dir,
     monitor="val_loss",
     mode="min",
     save_top_k=1,
@@ -141,7 +167,8 @@ trainer = L.Trainer(
     callbacks=[checkpoint_callback],
     accelerator=config.training.accelerator,
     devices=config.training.devices,
-    max_epochs=config.training.max_epochs,
+    max_epochs=MAX_EPOCHS,
+    max_steps=MAX_STEPS,
     gradient_clip_val=config.training.gradient_clip_val,
     num_sanity_val_steps=2,
 )

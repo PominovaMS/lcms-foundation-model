@@ -35,16 +35,22 @@ def encode_run(model, run_mz, run_I, device):
     return run_emb
 
 
-def _embed_batch(model, probe, batch, target_key, device):
-    runs_mz = batch["mz_array"]
-    runs_I = batch["intensity_array"]
-    targets = batch[target_key].to(device)
+def encode_dataset(model, loader, target_key, device):
+    """Encode every run in a loader ONCE to a fixed (N, d) embedding matrix.
 
-    runs_emb = [
-        encode_run(model, runs_mz[i], runs_I[i], device) for i in range(len(runs_mz))
-    ]
-    embs = torch.cat(runs_emb, dim=0)
-    return probe(embs), targets
+    The encoder is frozen, so a run's embedding never changes — precomputing it
+    once avoids re-running the transformer on every probe epoch (the previous
+    behavior, which made the probe ~n_epochs times slower than necessary).
+    Returns ``(embeddings, targets)`` on ``device``.
+    """
+    embs, targets = [], []
+    for batch in loader:
+        runs_mz = batch["mz_array"]
+        runs_I = batch["intensity_array"]
+        for i in range(len(runs_mz)):
+            embs.append(encode_run(model, runs_mz[i], runs_I[i], device))
+        targets.append(batch[target_key].to(device))
+    return torch.cat(embs, dim=0), torch.cat(targets, dim=0)
 
 
 def run_retrain_probe(
@@ -61,54 +67,43 @@ def run_retrain_probe(
 ) -> tuple[float, float]:
     """Train a fresh linear probe on the frozen encoder and evaluate it.
 
-    Returns ``(val_acc, val_loss)`` averaged over the probe validation loader.
+    Run embeddings are computed once up front (the encoder is frozen), then the
+    linear probe trains on those cached vectors. Returns ``(val_acc, val_loss)``.
     """
     device = device or next(model.parameters()).device
     model.eval()
 
+    # --- encode all runs once (the expensive part, done a single time) ---
+    X_train, y_train = encode_dataset(model, probe_train_loader, target_key, device)
+    X_val, y_val = encode_dataset(model, probe_val_loader, target_key, device)
+
     probe = nn.Linear(d_model, num_classes).to(device)
     optimizer = torch.optim.Adam(probe.parameters(), lr=lr)
 
-    # --- train the probe ---
+    # --- train the probe on cached embeddings (full-batch; it's just a linear map) ---
     probe.train()
     avg_loss = float("inf")  # enter the loop on the first iteration
-    avg_acc = 0.0
     probe_epoch = 0
     while (avg_loss > min_train_loss) and (probe_epoch < n_epochs):
-        total_loss, total_acc, n_batches = 0.0, 0.0, 0
-        for batch in probe_train_loader:
-            preds, targets = _embed_batch(model, probe, batch, target_key, device)
-            loss = F.cross_entropy(preds, targets)
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
+        optimizer.zero_grad()
+        preds = probe(X_train)
+        loss = F.cross_entropy(preds, y_train)
+        loss.backward()
+        optimizer.step()
 
-            acc = accuracy(
-                preds, targets, task="multiclass", num_classes=num_classes
-            )
-            total_loss += float(loss.detach())
-            total_acc += float(acc.detach())
-            n_batches += 1
-
-        avg_loss = total_loss / n_batches
-        avg_acc = total_acc / n_batches
-        logger.info(
-            f"Probe epoch {probe_epoch} loss: {avg_loss:.4f}  acc: {avg_acc:.4f}"
+        avg_loss = float(loss.detach())
+        avg_acc = float(
+            accuracy(preds, y_train, task="multiclass", num_classes=num_classes)
         )
+        logger.info(f"Probe epoch {probe_epoch} loss: {avg_loss:.4f}  acc: {avg_acc:.4f}")
         probe_epoch += 1
 
     # --- evaluate the probe ---
     probe.eval()
-    total_loss, total_acc, n_batches = 0.0, 0.0, 0
     with torch.no_grad():
-        for batch in probe_val_loader:
-            preds, targets = _embed_batch(model, probe, batch, target_key, device)
-            loss = F.cross_entropy(preds, targets)
-            acc = accuracy(preds, targets, task="multiclass", num_classes=num_classes)
-            total_loss += float(loss)
-            total_acc += float(acc)
-            n_batches += 1
-
-    val_loss = total_loss / n_batches
-    val_acc = total_acc / n_batches
+        preds = probe(X_val)
+        val_loss = float(F.cross_entropy(preds, y_val))
+        val_acc = float(
+            accuracy(preds, y_val, task="multiclass", num_classes=num_classes)
+        )
     return val_acc, val_loss
