@@ -100,18 +100,20 @@ class MS1Encoder(L.LightningModule):
         self.val_mae_I = torchmetrics.regression.MeanAbsoluteError()
 
     def get_peaks_mask(self, intensities, proportional=False, generator=None):
+        # Padding peaks have intensity exactly 0 (real peaks are strictly positive
+        # after intensity scaling), so `intensities != 0` is the real-peak mask.
+        is_real = intensities != 0
         if proportional:
             k = int(intensities.size(1) * self.masked_peaks_fraction)
             mask = torch.zeros_like(intensities, dtype=torch.bool)
-            # FIXME: assume we have no zero rows (= spectra with no peaks)
 
-            # compute sampling weights w
-            I_mean = intensities.sum(dim=1) / (intensities != 0).sum(
-                dim=1
-            )  # mean I of non-zero peaks
-            w = (
-                intensities + (intensities == 0).float() * I_mean[:, None]
-            )  # weight 0s by mean I
+            # Sampling weights: real peaks weighted by intensity, padding given a
+            # tiny epsilon. `torch.multinomial(replacement=False)` requires >= k
+            # strictly-positive weights per row, so the epsilon guarantees the call
+            # never errors when a spectrum has fewer than k real peaks. Because the
+            # epsilon is negligible next to real intensities, padding is only ever
+            # drawn once the real peaks are exhausted — and we drop it below.
+            w = intensities + (~is_real).float() * 1e-9
             # sample k indices without replacement, weighted by w
             idx = torch.multinomial(
                 w, num_samples=k, replacement=False, generator=generator
@@ -130,6 +132,9 @@ class MS1Encoder(L.LightningModule):
                 )
                 < self.masked_peaks_fraction
             )
+        # Never mask padding: drop any padding positions that were selected so they
+        # don't leak into the targets/loss as spurious bin-0 predictions.
+        mask &= is_real
         return mask
 
     def get_mz_bins(self, mz):
