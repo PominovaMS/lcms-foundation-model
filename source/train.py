@@ -3,7 +3,6 @@
 import argparse
 import os
 import yaml
-import polars as pl
 import pytorch_lightning as L
 from depthcharge.data import SpectrumDataset, spectra_to_df, preprocessing
 from torch.utils.data import DataLoader
@@ -84,42 +83,51 @@ preprocessing_fn = [
     preprocessing.scale_intensity(scaling="root", max_intensity=1.0),
 ]
 
-dfs = [
-    spectra_to_df(
-        os.path.join(train_data_dir, mzml_file),
-        metadata_df=None,
-        ms_level=1,
-        preprocessing_fn=preprocessing_fn,
-        valid_charge=None,
-        custom_fields=None,
-        progress=True,
-    )
-    for mzml_file in os.listdir(train_data_dir)
-]
-train_df = pl.concat(dfs, how="vertical")
+def build_dataset(data_dir, preprocessing_fn, batch_size):
+    """Build a SpectrumDataset by streaming one mzML into Lance at a time.
 
-val_dfs = [
-    spectra_to_df(
-        os.path.join(val_data_dir, mzml_file),
-        metadata_df=None,
-        ms_level=1,
-        preprocessing_fn=preprocessing_fn,
-        valid_charge=None,
-        custom_fields=None,
-        progress=True,
-    )
-    for mzml_file in os.listdir(val_data_dir)
-]
-val_df = pl.concat(val_dfs, how="vertical")
+    Appending per file (depthcharge's `add_spectra`, mode="append") keeps only a
+    single file's DataFrame in RAM, so peak memory scales with one file instead of
+    the whole corpus — the previous `pl.concat` of every file did not scale to a
+    full dataset (hundreds of ~195k-spectra files).
+    """
+    # Only feed mzML to the parser. depthcharge dispatches a parser by extension, and
+    # its MGF parser is MS2-only ("ms_level 1 is currently not supported") — so a stray
+    # .mgf (or any non-mzML) symlinked into the dir would crash MS1 ingestion. Match the
+    # `.mzml` convention used by the stage builders and peak_stats.py.
+    all_entries = sorted(os.listdir(data_dir))
+    mzml_files = [f for f in all_entries if f.lower().endswith((".mzml", ".mzml.gz"))]
+    skipped = [f for f in all_entries if f not in mzml_files]
+    if skipped:
+        print(f"Skipping {len(skipped)} non-mzML file(s) in {data_dir}: {skipped}")
 
-train_dataset = SpectrumDataset(train_df, batch_size=2)
-val_dataset = SpectrumDataset(val_df, batch_size=2)
+    ds = None
+    for mzml_file in mzml_files:
+        df = spectra_to_df(
+            os.path.join(data_dir, mzml_file),
+            metadata_df=None,
+            ms_level=1,
+            preprocessing_fn=preprocessing_fn,
+            valid_charge=None,
+            custom_fields=None,
+            progress=True,
+        )
+        if ds is None:
+            ds = SpectrumDataset(df, batch_size=batch_size)
+        else:
+            ds.add_spectra(df)
+        del df  # free this file before loading the next
+    if ds is None:
+        raise SystemExit(f"No mzML files in {data_dir}")
+    return ds
+
+
+train_dataset = build_dataset(train_data_dir, preprocessing_fn, BATCH_SIZE)
+val_dataset = build_dataset(val_data_dir, preprocessing_fn, BATCH_SIZE)
 print("N train spectra", train_dataset.n_spectra)
 print("N val spectra:", val_dataset.n_spectra)
 
-train_dataset.batch_size = BATCH_SIZE
 train_loader = DataLoader(train_dataset, batch_size=None, num_workers=0)
-val_dataset.batch_size = BATCH_SIZE
 val_loader = DataLoader(val_dataset, batch_size=None, num_workers=0)
 
 root_dir = os.path.join(CHECKPOINT_PATH, "foundation_model")
