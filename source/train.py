@@ -103,23 +103,34 @@ def build_dataset(data_dir, preprocessing_fn, batch_size):
         print(f"Skipping {len(skipped)} non-mzML file(s) in {data_dir}: {skipped}")
 
     ds = None
+    corrupt = []
     for mzml_file in mzml_files:
-        df = spectra_to_df(
-            os.path.join(data_dir, mzml_file),
-            metadata_df=None,
-            ms_level=1,
-            preprocessing_fn=preprocessing_fn,
-            valid_charge=None,
-            custom_fields=None,
-            progress=True,
-        )
+        try:
+            df = spectra_to_df(
+                os.path.join(data_dir, mzml_file),
+                metadata_df=None,
+                ms_level=1,
+                preprocessing_fn=preprocessing_fn,
+                valid_charge=None,
+                custom_fields=None,
+                progress=True,
+            )
+        except Exception as e:  # corrupt/truncated mzML — skip so one bad file
+            corrupt.append(mzml_file)  # doesn't kill a long run mid-build
+            print(f"WARNING: skipping unreadable mzML {mzml_file} ({type(e).__name__}: {e})")
+            continue
         if ds is None:
             ds = SpectrumDataset(df, batch_size=batch_size)
         else:
             ds.add_spectra(df)
         del df  # free this file before loading the next
+    if corrupt:
+        # Conspicuous summary so a systemic conversion problem can't hide behind
+        # per-file warnings scrolled off the log.
+        print(f"WARNING: skipped {len(corrupt)}/{len(mzml_files)} unreadable mzML "
+              f"file(s) in {data_dir}: {corrupt}")
     if ds is None:
-        raise SystemExit(f"No mzML files in {data_dir}")
+        raise SystemExit(f"No readable mzML files in {data_dir}")
     return ds
 
 
