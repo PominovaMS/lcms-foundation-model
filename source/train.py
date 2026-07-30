@@ -1,6 +1,7 @@
 """Train the model."""  # Should this script be outside of the source folder (as a main entry point)?
 
 import argparse
+import math
 import os
 import yaml
 import pytorch_lightning as L
@@ -127,6 +128,22 @@ val_dataset = build_dataset(val_data_dir, preprocessing_fn, BATCH_SIZE)
 print("N train spectra", train_dataset.n_spectra)
 print("N val spectra:", val_dataset.n_spectra)
 
+# Resolve the cosine LR half-period. It must equal the run's total optimizer
+# steps so LR anneals to ~0 exactly at the end (past it, LR re-rises). We can't
+# use trainer.estimated_stepping_batches here because SpectrumDataset is an
+# IterableDataset with no __len__, so compute it from n_spectra / batch_size.
+steps_per_epoch = math.ceil(train_dataset.n_spectra / BATCH_SIZE)
+if MAX_STEPS != -1:
+    total_steps = MAX_STEPS
+else:
+    total_steps = steps_per_epoch * MAX_EPOCHS
+cosine_period = config.optimizer.cosine_schedule_period_iters or total_steps
+print(
+    f"steps/epoch={steps_per_epoch}  total_steps={total_steps}  "
+    f"cosine_schedule_period_iters={cosine_period}"
+    f"{' (from config)' if config.optimizer.cosine_schedule_period_iters else ' (auto)'}"
+)
+
 train_loader = DataLoader(train_dataset, batch_size=None, num_workers=0)
 val_loader = DataLoader(val_dataset, batch_size=None, num_workers=0)
 
@@ -165,7 +182,7 @@ model = MS1Encoder(
     masked_peaks_fraction=config.model.masked_peaks_fraction,
     lr=config.optimizer.lr,
     warmup_iters=config.optimizer.warmup_iters,
-    cosine_schedule_period_iters=config.optimizer.cosine_schedule_period_iters,
+    cosine_schedule_period_iters=cosine_period,
 )
 
 trainer = L.Trainer(
