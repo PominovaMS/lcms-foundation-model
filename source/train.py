@@ -55,10 +55,31 @@ parser.add_argument(
     help="Stop after this many optimizer steps (overrides --max_epochs). Use this to "
     "train every diversity stage to the SAME number of steps for a fair comparison.",
 )
+parser.add_argument(
+    "--lr",
+    type=float,
+    default=None,
+    help="Override config.optimizer.lr (peak LR after warmup). Use this to sweep LR "
+    "from a job script without editing the shared config.",
+)
+parser.add_argument(
+    "--warmup_iters",
+    type=int,
+    default=None,
+    help="Override config.optimizer.warmup_iters (linear warmup length in optimizer "
+    "steps). Raise it alongside --lr for large/heterogeneous training sets.",
+)
 args = parser.parse_args()
 
 # Load configuration
 config = load_config(args.config)
+
+# Optimizer overrides: CLI wins over the config file so a job script can sweep LR
+# without editing config.yaml (which every other experiment also reads).
+LR = args.lr if args.lr is not None else config.optimizer.lr
+WARMUP_ITERS = (
+    args.warmup_iters if args.warmup_iters is not None else config.optimizer.warmup_iters
+)
 
 # Extract configuration values
 BATCH_SIZE = config.data.batch_size
@@ -154,6 +175,11 @@ print(
     f"cosine_schedule_period_iters={cosine_period}"
     f"{' (from config)' if config.optimizer.cosine_schedule_period_iters else ' (auto)'}"
 )
+print(
+    f"lr={LR}{' (CLI)' if args.lr is not None else ' (config)'}  "
+    f"warmup_iters={WARMUP_ITERS}"
+    f"{' (CLI)' if args.warmup_iters is not None else ' (config)'}"
+)
 
 train_loader = DataLoader(train_dataset, batch_size=None, num_workers=0)
 val_loader = DataLoader(val_dataset, batch_size=None, num_workers=0)
@@ -191,8 +217,8 @@ model = MS1Encoder(
     bin_mz_min=config.model.bin_mz_min,
     bin_mz_max=config.model.bin_mz_max,
     masked_peaks_fraction=config.model.masked_peaks_fraction,
-    lr=config.optimizer.lr,
-    warmup_iters=config.optimizer.warmup_iters,
+    lr=LR,
+    warmup_iters=WARMUP_ITERS,
     cosine_schedule_period_iters=cosine_period,
 )
 

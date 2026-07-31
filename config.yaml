@@ -7,7 +7,7 @@ name: "ms1-mz-200_peaks-sqrt-clf_run_retrain" # ms1 # retrain finetuning
 data:
   train_dir: "train_mzml"
   val_dir: "val_mzml"
-  batch_size: 2000
+  batch_size: 1024   # 2000 OOMs the 44GB L40S (fp32); lower this further if still tight
   max_num_peaks: 200
 
 # Model configuration
@@ -25,8 +25,13 @@ model:
 # Optimizer settings
 optimizer:
   lr: 0.0005 # 0.0003
-  warmup_iters: 1000
-  cosine_schedule_period_iters: 64000 # 32000
+  warmup_iters: 2000  # diverse data: gentler start to avoid early loss spikes
+  # Cosine HALF-period: LR anneals to ~0 over this many optimizer steps, then
+  # (unclamped) climbs back up — so it must equal the run's TOTAL steps.
+  # `null` = auto-derive in train.py from the run's stop criterion:
+  #   --max_steps if given, else ceil(n_train_spectra / batch_size) * max_epochs.
+  # Set an explicit int here only to override the derivation for an experiment.
+  cosine_schedule_period_iters: null
 
 # Training settings
 training:
