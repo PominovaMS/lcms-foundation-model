@@ -75,3 +75,27 @@ python eval/probe_checkpoint.py \
 `sweep.csv` gains one row per stage
 (`run_name, ckpt_path, n_probe_classes, probe_val_acc, probe_val_loss`) — plot
 `probe_val_acc` against the number of pretraining datasets to read off the curve.
+
+## Data QC — `mass_dist.py`
+
+Compare the **MS1 peak m/z distribution** of each new PRIDE repository against the abele
+data, to check for a train/eval distribution shift. The model only predicts m/z bins over
+`[bin_mz_min, bin_mz_max)` = `[300, 1500)` (peaks below → ignored `-1`; at/above → top bin),
+so a repo whose mass distribution is shifted — or that carries a lot of mass outside that
+window — is worth spotting before pretraining on it.
+
+Each PXD accession is one series (its own table row, curve, and JSD/TV/KS divergence vs the
+reference); abele is the reference. Uses the same preprocessing as `train.py`; no model/GPU.
+Reading is parse-dominated, so `--limit-files` (default 5, strided per series) is the main
+speed knob — an m/z distribution stabilises on very few files.
+
+```bash
+python scripts/mass_dist.py \
+    --pride-root /mnt/data/shared/lc_ms_foundation/pride_data \
+    --dataset abele /mnt/data/shared/lc_ms_foundation/abele_data/mzml \
+    --reference abele -o mass_dist.png --dump-csv mass_dist.csv
+```
+
+Prints a per-series stats table (mean/median/quantiles, `%<300`, `%≥1500`, `%in-window`,
+`JSDvsref`), writes a two-panel overlay PNG (full range + model-window zoom, abele bold), and
+optionally dumps per-bin counts to CSV for custom replots.
