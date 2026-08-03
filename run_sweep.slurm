@@ -3,7 +3,7 @@
 # Build one mixed training set from ALL accessions, pretrain, then probe on abele.
 #   Single mixed run:  sbatch run_sweep.slurm
 
-#SBATCH --partition=one_day
+#SBATCH --partition=seven_days
 #SBATCH --job-name=pride_sweep
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
@@ -27,12 +27,22 @@ ABELE_MZML=/mnt/data/shared/lc_ms_foundation/abele_data/mzml
 ABELE_META=/mnt/data/shared/lc_ms_foundation/abele_data/all_abele_metadata.csv
 
 # Datasets to mix into a single training set
-ACCESSIONS=(PXD014877 PXD004452 PXD012345 PXD067890)
+ACCESSIONS=(PXD004452 PXD012636 PXD009737 PXD030983 PXD013868)
 MAX_EPOCHS=50     # smoke test; raise for the real run
-LIMIT=50         # smoke test: files per accession. Set empty ("") to use all.
+LIMIT=100         # smoke test: files per accession. Set empty ("") to use all.
 PROBE_ALL=      # empty = probe 15 mid-sized genera. Set to 1 to probe ALL genera (slower).
-RUN_TAG=lim50x4_ep50        # optional label to separate runs of the SAME stage (e.g. "lim25_ep50").
+
+# Optimizer overrides (empty = use config.yaml: lr 5e-4, warmup 2000). Set these to
+# sweep LR without touching the shared config, which the abele runs also read.
+# Bigger + more heterogeneous training sets tolerate (and usually want) a higher
+# peak LR, but need a longer warmup so the early, high-variance batches from five
+# different labs don't spike the loss before the schedule has ramped.
+LR=1e-3
+WARMUP_ITERS=6000
+
+RUN_TAG=lim5x100_ep50_lr1e-3        # optional label to separate runs of the SAME stage (e.g. "lim25_ep50").
                 # Keeps checkpoints, logs, and results from colliding/overwriting.
+                # Include the LR here whenever you change it, or runs overwrite each other.
 
 # Stage = array index, or 1 for a bare submit. RUN adds the optional tag so distinct
 # configs (e.g. a data-volume ramp on one accession) don't overwrite each other.
@@ -53,7 +63,8 @@ rm -rf "$STAGE_DIR"
 # 2) Pretrain (train.py runs from source/, so checkpoints land under source/).
 ( cd source && "$ENV/bin/python" train.py \
     --data_dir "$STAGE_DIR" --config ../config.yaml \
-    --run_name "$RUN" --max_epochs "$MAX_EPOCHS" )
+    --run_name "$RUN" --max_epochs "$MAX_EPOCHS" \
+    ${LR:+--lr "$LR"} ${WARMUP_ITERS:+--warmup_iters "$WARMUP_ITERS"} )
 
 # 3) Probe the checkpoint on abele -> one row in results/<run>.csv.
 mkdir -p "$REPO/results"
