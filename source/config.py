@@ -27,7 +27,9 @@ class ModelConfig:
 class OptimizerConfig:
     lr: float
     warmup_iters: int
-    cosine_schedule_period_iters: int
+    # None (yaml `null`) means auto-derive from the run's total optimizer steps
+    # in train.py; an explicit int overrides that derivation.
+    cosine_schedule_period_iters: Optional[int] = None
 
 
 @dataclass
