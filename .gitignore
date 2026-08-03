@@ -219,3 +219,6 @@ notebooks/dev/
 # Claude files
 CLAUDE.md
 .claude/
+
+# Slurm files
+*.slurm
