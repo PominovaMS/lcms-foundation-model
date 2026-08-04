@@ -142,3 +142,31 @@ python scripts/mass_dist.py \
 Prints a per-series stats table (mean/median/quantiles, `%<300`, `%≥1500`, `%in-window`,
 `JSDvsref`), writes a two-panel overlay PNG (full range + model-window zoom, abele bold), and
 optionally dumps per-bin counts to CSV for custom replots.
+
+## Training curves — `plot_curves.py`
+
+Overlay loss / accuracy / lr curves from one or more runs' TensorBoard event files into a
+single PNG. Pass several run dirs to compare diversity stages on the same axes; on the
+loss and accuracy panels color encodes train vs val and linestyle encodes the run.
+
+```bash
+python scripts/plot_curves.py ./tb_logs/stage01 ./tb_logs/stage04 -o compare.png
+```
+
+`train_loss` and `train_acc_mz_bin` are logged per optimizer step, so the raw curves are
+mostly batch-to-batch noise. By default the raw values are drawn as a faint trace with a
+TensorBoard-style EMA (bias-corrected) over the top carrying the trend:
+
+| flag | default | effect |
+| --- | --- | --- |
+| `--smooth` | `0.9` | EMA weight. `0` disables it and plots the raw curves alone; `0.98` for a long, noisy run. |
+| `--smooth-min-points` | `50` | Only smooth series with at least this many points, which leaves the per-epoch curves (`val_*`, and the `retrain_*` / `online_*` probe metrics — already means over a whole loader) raw. |
+
+The `lr` panel is never smoothed: it is deterministic, and checking the schedule shape is
+what that panel is for.
+
+One thing to keep in mind when reading a train-vs-val gap: an EMA is causal, so on a
+falling curve the smoothed line sits slightly *above* the raw values (~`1/(1-weight)`
+points of lag — about 10 logged points at 0.9). Part of any apparent train-above-val gap
+early in a run is that lag, not the model. The faint raw trace underneath is what to check
+it against.

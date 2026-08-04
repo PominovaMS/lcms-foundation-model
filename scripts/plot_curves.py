@@ -7,6 +7,10 @@ directories, pulls those scalars out of the event files, and writes a PNG with t
 stacked panels (loss, accuracy, lr). Pass several run dirs to overlay them — handy for
 comparing data-diversity stages on the same axes.
 
+The per-step curves are dominated by batch-to-batch noise, so they are drawn twice: the
+raw values as a faint trace and a TensorBoard-style EMA on top carrying the trend (see
+``ema_smooth``). ``--smooth 0`` turns that off and plots the raw values alone.
+
 Reading the events needs only ``tensorboard`` (already a dependency of
 ``TensorBoardLogger``); TensorFlow is not required.
 
@@ -17,9 +21,13 @@ Usage
 
     # overlay several runs
     python /Users/adams/Code/lcms-foundation-model/scripts/plot_curves.py .stage01 ./tb_logs/stage04 -o compare.png
+
+    # heavier smoothing on a long, noisy run (or --smooth 0 for the raw curves)
+    python /Users/adams/Code/lcms-foundation-model/scripts/plot_curves.py ./tb_logs/stage04 --smooth 0.98
 """
 
 import argparse
+import math
 import os
 from collections import defaultdict
 
@@ -49,6 +57,39 @@ LINE_ALPHA = 0.75
 # When multiple runs are overlaid on a train/val panel, color is spoken for
 # (train vs val), so line style is used to tell runs apart instead.
 RUN_LINESTYLES = ["-", "--", "-.", ":"]
+
+# Smoothed curves are drawn over a ghost of the raw values, so you can still see the
+# spread the trend line was fitted through.
+RAW_ALPHA = 0.18
+RAW_LINEWIDTH = 1.0
+SMOOTH_ALPHA = 0.9
+SMOOTH_LINEWIDTH = 1.6
+
+# Panels whose curves get smoothed. ``lr`` is deterministic — smoothing it would
+# misrepresent the schedule, which is exactly the thing that panel exists to check.
+SMOOTHED_PANELS = {"loss", "accuracy"}
+
+
+def ema_smooth(values, weight: float) -> list[float]:
+    """TensorBoard-style exponential moving average with bias correction.
+
+    ``weight`` in [0, 1): 0 is no smoothing, 0.9 is a good default, 0.99 is heavy.
+    The debias term is what keeps the head of the curve honest — a plain EMA starts
+    at 0 and ramps up, which reads as a loss drop that never happened. Non-finite
+    values pass through untouched so a NaN spike stays visible at the step it
+    occurred instead of poisoning the whole tail.
+    """
+    if weight <= 0:
+        return list(values)
+    last, n_acc, out = 0.0, 0, []
+    for v in values:
+        if not math.isfinite(v):
+            out.append(v)
+            continue
+        last = last * weight + (1 - weight) * v
+        n_acc += 1
+        out.append(last / (1 - weight**n_acc))  # debias
+    return out
 
 
 def find_event_dirs(run_dir: str) -> list[str]:
@@ -94,7 +135,23 @@ def main():
     parser.add_argument(
         "--log-loss", action="store_true", help="Log-scale the loss panel's y-axis"
     )
+    parser.add_argument(
+        "--smooth",
+        type=float,
+        default=0.9,
+        help="EMA weight for the loss/accuracy trend lines (0 = off, plot raw only)",
+    )
+    parser.add_argument(
+        "--smooth-min-points",
+        type=int,
+        default=50,
+        help="Only smooth series with at least this many points. Keeps the per-epoch "
+        "curves (val_*, and the retrain_*/online_* probe metrics, which are already "
+        "means over a whole loader) raw, and smooths the noisy per-step ones.",
+    )
     args = parser.parse_args()
+    if not 0 <= args.smooth < 1:
+        raise SystemExit(f"--smooth must be in [0, 1), got {args.smooth}")
 
     runs = {label_for(d): load_scalars(d) for d in args.run_dirs}
 
@@ -128,15 +185,44 @@ def main():
                     color = run_color
                     style = "--" if is_val else "-"
                 lbl = tag if len(runs) == 1 else f"{run_name}:{tag}"
-                ax.plot(
-                    steps,
-                    vals,
-                    style,
-                    color=color,
-                    linewidth=1.5,
-                    alpha=LINE_ALPHA,
-                    label=lbl,
+                smooth = (
+                    panel_name in SMOOTHED_PANELS
+                    and args.smooth > 0
+                    and len(steps) >= args.smooth_min_points
                 )
+                if smooth:
+                    # Raw values as an unlabelled ghost so the legend keeps exactly one
+                    # entry per tag, with the trend line drawn over it.
+                    ax.plot(
+                        steps,
+                        vals,
+                        style,
+                        color=color,
+                        linewidth=RAW_LINEWIDTH,
+                        alpha=RAW_ALPHA,
+                        zorder=1,
+                        label="_nolegend_",
+                    )
+                    ax.plot(
+                        steps,
+                        ema_smooth(vals, args.smooth),
+                        style,
+                        color=color,
+                        linewidth=SMOOTH_LINEWIDTH,
+                        alpha=SMOOTH_ALPHA,
+                        zorder=2,
+                        label=f"{lbl} (ema {args.smooth:g})",
+                    )
+                else:
+                    ax.plot(
+                        steps,
+                        vals,
+                        style,
+                        color=color,
+                        linewidth=1.5,
+                        alpha=LINE_ALPHA,
+                        label=lbl,
+                    )
                 plotted = True
         ax.set_ylabel(panel_name)
         ax.grid(True, alpha=0.3)
