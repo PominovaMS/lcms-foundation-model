@@ -135,6 +135,14 @@ def main():
         "genus_class"
     ].n_unique()
 
+    # Length of the one-cycle LR schedule. Unlike train.py (whose IterableDataset has
+    # no __len__, so it estimates and pads) these loaders are map-style, so the step
+    # count is exact and needs no margin.
+    total_steps = config.optimizer.total_steps or (
+        len(train_loader) * args.ssl_max_epochs
+    )
+    logging.info(f"LR schedule total_steps: {total_steps}")
+
     model = MS1Encoder(
         d_model=config.model.d_model,
         nhead=config.model.nhead,
@@ -147,7 +155,9 @@ def main():
         masked_peaks_fraction=config.model.masked_peaks_fraction,
         lr=config.optimizer.lr,
         warmup_iters=config.optimizer.warmup_iters,
-        cosine_schedule_period_iters=config.optimizer.cosine_schedule_period_iters,
+        total_steps=total_steps,
+        div_factor=config.optimizer.div_factor,
+        final_div_factor=config.optimizer.final_div_factor,
     )
 
     root_dir = os.path.join(config.training.checkpoint_path, "foundation_model")

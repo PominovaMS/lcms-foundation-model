@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pandas as pd  # DEBUG
 import torch
@@ -6,14 +8,6 @@ import torchmetrics
 import pytorch_lightning as L
 from depthcharge.encoders import PeakEncoder, PositionalEncoder
 from depthcharge.transformers import SpectrumTransformerEncoder
-
-# Support both import contexts: as a package (`from source.model import ...`, used
-# by eval/) the relative import works; run as a script (`cd source && python
-# train.py`) there is no parent package, so fall back to the top-level module.
-try:
-    from .scheduler import CosineWarmupScheduler
-except ImportError:
-    from scheduler import CosineWarmupScheduler
 
 # from IPython.display import clear_output # DEBUG
 # pd.set_option('display.max_rows', 500) # DEBUG
@@ -35,10 +29,24 @@ class MS1Encoder(L.LightningModule):
         mask_proportional=True,
         lr=5e-4,
         warmup_iters=1000,
-        cosine_schedule_period_iters=32000,
+        total_steps=32000,
+        div_factor=25.0,
+        final_div_factor=1e4,
+        cosine_schedule_period_iters=None,
     ):
         super().__init__()
-        self.save_hyperparameters()
+        if cosine_schedule_period_iters is not None:
+            # Checkpoints trained before the OneCycleLR switch saved the LR schedule
+            # length under this name. `load_from_checkpoint` replays saved hparams as
+            # keyword arguments, so accepting the old name is what keeps those
+            # checkpoints loadable (eval/probe_checkpoint.py reads them).
+            # noqa is for ruff, which can't see that the reassignment is consumed:
+            # `save_hyperparameters` reads it back out of the frame locals below.
+            total_steps = cosine_schedule_period_iters  # noqa: F841
+        # `save_hyperparameters` reads the current frame locals, so it picks up the
+        # remapped `total_steps` above; the legacy name is dropped so hparams keep a
+        # single source of truth for the schedule length.
+        self.save_hyperparameters(ignore=["cosine_schedule_period_iters"])
 
         self.d_model = d_model
         self.nhead = nhead
@@ -297,14 +305,38 @@ class MS1Encoder(L.LightningModule):
     def configure_optimizers(
         self,
     ):
-        """TODO."""
+        """Adam + a one-cycle LR schedule (warmup to ``lr``, then cosine anneal).
+
+        ``total_steps`` must be at least the number of optimizer steps the run will
+        take: ``OneCycleLR`` raises once stepped past it. ``train.py`` derives it from
+        the run's stop criterion and pads it slightly for that reason.
+        """
         optimizer = torch.optim.Adam(
             self.parameters(), lr=self.hparams.lr, betas=(0.9, 0.98)
         )
-        self.lr_scheduler = CosineWarmupScheduler(
+        # Warmup is configured in steps (the CLI and slurm scripts speak steps);
+        # OneCycleLR wants it as a fraction of the cycle.
+        raw_pct = self.hparams.warmup_iters / self.hparams.total_steps
+        pct_start = min(max(raw_pct, 1e-3), 0.5)
+        if pct_start != raw_pct:
+            warnings.warn(
+                f"warmup_iters={self.hparams.warmup_iters} is "
+                f"{raw_pct:.4g} of total_steps={self.hparams.total_steps}; "
+                f"clamped pct_start to {pct_start:g} (must be in (0, 1)).",
+                stacklevel=2,
+            )
+        self.lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            self.hparams.warmup_iters,
-            self.hparams.cosine_schedule_period_iters,
+            max_lr=self.hparams.lr,
+            total_steps=self.hparams.total_steps,
+            pct_start=pct_start,
+            anneal_strategy="cos",
+            div_factor=self.hparams.div_factor,
+            final_div_factor=self.hparams.final_div_factor,
+            # Adam exposes `betas`, not `momentum`: left on, OneCycleLR would cycle
+            # betas[0] between 0.85 and 0.95 and silently override the (0.9, 0.98)
+            # pinned above.
+            cycle_momentum=False,
         )
         return {
             "optimizer": optimizer,
@@ -312,7 +344,7 @@ class MS1Encoder(L.LightningModule):
                 "scheduler": self.lr_scheduler,
                 "interval": "step",
                 "frequency": 1,
-                "name": "cosine_warmup",
+                "name": "one_cycle",
             },
         }
 

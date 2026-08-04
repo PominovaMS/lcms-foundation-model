@@ -25,11 +25,13 @@ class ModelConfig:
 
 @dataclass
 class OptimizerConfig:
-    lr: float
+    lr: float  # peak LR of the one-cycle schedule
     warmup_iters: int
-    # None (yaml `null`) means auto-derive from the run's total optimizer steps
-    # in train.py; an explicit int overrides that derivation.
-    cosine_schedule_period_iters: Optional[int] = None
+    # Length of the one-cycle LR schedule, in optimizer steps. None (yaml `null`)
+    # means derive it from the run's stop criterion; an explicit int overrides that.
+    total_steps: Optional[int] = None
+    div_factor: float = 25.0  # initial LR = lr / div_factor
+    final_div_factor: float = 1e4  # final LR = initial LR / final_div_factor
 
 
 @dataclass

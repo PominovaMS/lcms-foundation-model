@@ -3,7 +3,7 @@
 # Build one mixed training set from ALL accessions, pretrain, then probe on abele.
 #   Single mixed run:  sbatch run_sweep.slurm
 
-#SBATCH --partition=seven_days
+#SBATCH --partition=one_day
 #SBATCH --job-name=pride_sweep
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
@@ -29,7 +29,7 @@ ABELE_META=/mnt/data/shared/lc_ms_foundation/abele_data/all_abele_metadata.csv
 # Datasets to mix into a single training set
 ACCESSIONS=(PXD004452 PXD012636 PXD009737 PXD030983 PXD013868)
 MAX_EPOCHS=50     # smoke test; raise for the real run
-LIMIT=100         # smoke test: files per accession. Set empty ("") to use all.
+LIMIT=25         # smoke test: files per accession. Set empty ("") to use all.
 PROBE_ALL=      # empty = probe 15 mid-sized genera. Set to 1 to probe ALL genera (slower).
 
 # --- probe split + probe reproducibility -----------------------------------
@@ -51,10 +51,10 @@ PROBE_REPEATS=3           # accuracy is the mean over this many seeded probe fit
 # Bigger + more heterogeneous training sets tolerate (and usually want) a higher
 # peak LR, but need a longer warmup so the early, high-variance batches from five
 # different labs don't spike the loss before the schedule has ramped.
-LR=1e-3
+LR=5e-4
 WARMUP_ITERS=6000
 
-RUN_TAG=lim5x100_ep50_lr1e-3        # optional label to separate runs of the SAME stage (e.g. "lim25_ep50").
+RUN_TAG=lim5x25_ep50_lr5e-4        # optional label to separate runs of the SAME stage (e.g. "lim25_ep50").
                 # Keeps checkpoints, logs, and results from colliding/overwriting.
                 # Include the LR here whenever you change it, or runs overwrite each other.
 

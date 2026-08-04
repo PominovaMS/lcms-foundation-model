@@ -160,25 +160,36 @@ val_dataset = build_dataset(val_data_dir, preprocessing_fn, BATCH_SIZE)
 print("N train spectra", train_dataset.n_spectra)
 print("N val spectra:", val_dataset.n_spectra)
 
-# Resolve the cosine LR half-period. It must equal the run's total optimizer
-# steps so LR anneals to ~0 exactly at the end (past it, LR re-rises). We can't
-# use trainer.estimated_stepping_batches here because SpectrumDataset is an
+# Resolve the length of the one-cycle LR schedule. We can't use
+# trainer.estimated_stepping_batches here because SpectrumDataset is an
 # IterableDataset with no __len__, so compute it from n_spectra / batch_size.
 steps_per_epoch = math.ceil(train_dataset.n_spectra / BATCH_SIZE)
+# OneCycleLR raises once it is stepped past total_steps, so the schedule must be at
+# least as long as the run. With --max_steps the count is exact (Lightning stops there),
+# so use it as-is and let LR anneal fully. The epochs path is an estimate that can be
+# off by a batch or two, so pad it: an undercount would kill a multi-day run, and the
+# only cost of overshooting is that LR stops a hair above its floor.
+SCHEDULE_MARGIN = 1.02
 if MAX_STEPS != -1:
     total_steps = MAX_STEPS
+    derivation = "exact (--max_steps)"
+    total_steps_sched = total_steps
 else:
     total_steps = steps_per_epoch * MAX_EPOCHS
-cosine_period = config.optimizer.cosine_schedule_period_iters or total_steps
+    derivation = "estimated from n_spectra, padded"
+    total_steps_sched = math.ceil(total_steps * SCHEDULE_MARGIN) + 10
+if config.optimizer.total_steps:
+    total_steps_sched = config.optimizer.total_steps
+    derivation = "from config"
 print(
     f"steps/epoch={steps_per_epoch}  total_steps={total_steps}  "
-    f"cosine_schedule_period_iters={cosine_period}"
-    f"{' (from config)' if config.optimizer.cosine_schedule_period_iters else ' (auto)'}"
+    f"schedule_total_steps={total_steps_sched} ({derivation})"
 )
 print(
     f"lr={LR}{' (CLI)' if args.lr is not None else ' (config)'}  "
     f"warmup_iters={WARMUP_ITERS}"
-    f"{' (CLI)' if args.warmup_iters is not None else ' (config)'}"
+    f"{' (CLI)' if args.warmup_iters is not None else ' (config)'}  "
+    f"pct_start={WARMUP_ITERS / total_steps_sched:.4g}"
 )
 
 train_loader = DataLoader(train_dataset, batch_size=None, num_workers=0)
@@ -219,7 +230,9 @@ model = MS1Encoder(
     masked_peaks_fraction=config.model.masked_peaks_fraction,
     lr=LR,
     warmup_iters=WARMUP_ITERS,
-    cosine_schedule_period_iters=cosine_period,
+    total_steps=total_steps_sched,
+    div_factor=config.optimizer.div_factor,
+    final_div_factor=config.optimizer.final_div_factor,
 )
 
 trainer = L.Trainer(

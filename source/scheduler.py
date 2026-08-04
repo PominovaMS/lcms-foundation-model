@@ -8,6 +8,9 @@ class CosineWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
     Learning rate scheduler with linear warm-up followed by cosine
     shaped decay.
 
+    Superseded: ``MS1Encoder`` now uses ``torch.optim.lr_scheduler.OneCycleLR``.
+    This is kept only so the notebooks under ``notebooks/`` still import.
+
     Parameters
     ----------
     optimizer : torch.optim.Optimizer
