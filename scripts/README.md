@@ -60,7 +60,8 @@ Checkpoints (including a stable `last.ckpt`) are written under
 Loads a pretrained checkpoint, freezes the encoder, trains a fresh linear probe on
 the abele genus task, and reports validation accuracy. Point `--results_csv` at the
 **same file** for every stage to accumulate the scaling curve. Keep
-`--n_probe_genera` / `--n_ssl_top` identical across stages so the probe split is fixed.
+`--n_probe_genera`, `--n_ssl_top`, `--max_files_per_species` and
+`--max_files_per_genus` identical across stages so the probe split is fixed.
 
 ```bash
 python eval/probe_checkpoint.py \
@@ -72,9 +73,51 @@ python eval/probe_checkpoint.py \
     --results_csv sweep.csv
 ```
 
-`sweep.csv` gains one row per stage
-(`run_name, ckpt_path, n_probe_classes, probe_val_acc, probe_val_loss`) — plot
-`probe_val_acc` against the number of pretraining datasets to read off the curve.
+`sweep.csv` gains one row per stage — plot `probe_val_acc` against the number of
+pretraining datasets to read off the curve. Every split and probe setting is
+recorded alongside the metrics, so a row is self-describing.
+
+#### Reading the numbers
+
+Accuracy is a **mean over `--probe_repeats` (default 3) seeded probe fits**; the
+probe initialisation is the only stochastic element, so `probe_val_acc_std` is the
+noise floor. **Two runs are only distinguishable if their gap exceeds it.** Use
+`--probe_seed` to reproduce a row exactly.
+
+Four columns exist to tell a *collapsed* probe from a merely weak one — a probe
+that predicts one class for every run can still post a respectable micro accuracy:
+
+| column | meaning |
+| --- | --- |
+| `probe_val_acc_macro` | per-class mean accuracy; unaffected by class imbalance |
+| `majority_acc` | score of always predicting the train-modal class — what a collapsed probe gets |
+| `random_acc` | `1 / n_probe_classes` |
+| `n_pred_classes` | distinct classes predicted on val; **1 means collapsed** |
+
+`probe_epochs` distinguishes a third case: if it pins at `--probe_n_epochs`, the
+probe never reached `--probe_min_train_loss` and is *underfit*, not collapsed.
+
+#### Probe class balance
+
+`assign_splits` alternates *species* between probe train and val, which assumes
+species carry comparable file counts. In abele they do not — 80 of the 87 probe
+species have 3 files, but *Escherichia coli* has 48, and being alphabetically
+first it always lands in probe_train. Left uncapped it is 25% of probe_train and
+2.3% of probe_val, so a probe that collapses onto it scores *below* random.
+
+`--max_files_per_species` (default 3, the modal count) caps each species within
+each probe split, keeping evenly-strided files rather than a prefix. Capped-out
+files become `split="unused"` and are read by nothing — in particular they are
+**not** donated to the SSL split, which would leak probe genera into pretraining.
+
+| setting | train | val | train-vs-val TV | `majority_acc` |
+| --- | --- | --- | --- | --- |
+| `--max_files_per_species 0` (no cap) | 192 | 132 | 0.232 | 0.023 |
+| `--max_files_per_species 3` (default) | 141 | 120 | 0.082 | 0.175 |
+| `... 3 --max_files_per_genus 6` | 87 | 87 | 0.000 | 0.069 |
+
+The per-genus cap balances the classes exactly, at roughly half the files. Numbers
+produced under different caps are not comparable.
 
 ## Data QC — `mass_dist.py`
 

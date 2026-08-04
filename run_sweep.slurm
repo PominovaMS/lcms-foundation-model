@@ -32,6 +32,20 @@ MAX_EPOCHS=50     # smoke test; raise for the real run
 LIMIT=100         # smoke test: files per accession. Set empty ("") to use all.
 PROBE_ALL=      # empty = probe 15 mid-sized genera. Set to 1 to probe ALL genera (slower).
 
+# --- probe split + probe reproducibility -----------------------------------
+# These define the EVAL, not the model. Every run you intend to compare must use
+# identical values — they are passed explicitly rather than left to argparse
+# defaults so a default change can never silently make new rows incomparable with
+# old ones. All of them are recorded in the results CSV, so each row is
+# self-describing.
+N_PROBE_GENERA=15
+N_SSL_TOP=3
+MAX_FILES_PER_SPECIES=3   # caps E. coli's 48 files (0 = no cap, the old skewed split)
+MAX_FILES_PER_GENUS=0     # 0 = off; set to balance classes exactly (~half the files)
+PROBE_SEED=0
+PROBE_REPEATS=3           # accuracy is the mean over this many seeded probe fits;
+                          # the reported std is the noise floor for comparing runs
+
 # Optimizer overrides (empty = use config.yaml: lr 5e-4, warmup 2000). Set these to
 # sweep LR without touching the shared config, which the abele runs also read.
 # Bigger + more heterogeneous training sets tolerate (and usually want) a higher
@@ -67,11 +81,21 @@ rm -rf "$STAGE_DIR"
     ${LR:+--lr "$LR"} ${WARMUP_ITERS:+--warmup_iters "$WARMUP_ITERS"} )
 
 # 3) Probe the checkpoint on abele -> one row in results/<run>.csv.
+#    Results stay in a PER-RUN file: this script reads SLURM_ARRAY_TASK_ID, so it
+#    can run as an array, and concurrent appends to one shared CSV on networked
+#    storage are not guaranteed atomic. Every row records its own split settings,
+#    so comparing runs is just reading several files:
+#        python scripts/plot_sweep.py --results_csv results/*.csv -o compare.png
 mkdir -p "$REPO/results"
 "$ENV/bin/python" eval/probe_checkpoint.py \
     --ckpt_path "$CKPT" --data_dir "$ABELE_MZML" --meta_path "$ABELE_META" \
     --config config.yaml --run_name "$RUN" \
+    --n_probe_genera "$N_PROBE_GENERA" --n_ssl_top "$N_SSL_TOP" \
+    --max_files_per_species "$MAX_FILES_PER_SPECIES" \
+    --max_files_per_genus "$MAX_FILES_PER_GENUS" \
+    --probe_seed "$PROBE_SEED" --probe_repeats "$PROBE_REPEATS" \
     --results_csv "$REPO/results/$RUN.csv" \
     ${PROBE_ALL:+--probe_all}
 
-cat "$REPO/results/$RUN.csv"
+# 21 columns on one line is unreadable in a slurm log; tabulate if `column` exists.
+column -s, -t < "$REPO/results/$RUN.csv" || cat "$REPO/results/$RUN.csv"

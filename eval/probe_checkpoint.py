@@ -5,9 +5,15 @@ encoder, trains a fresh linear probe on the abele genus-classification task, and
 reports validation accuracy. Unlike ``eval/retrain_eval.py`` this does NOT run any
 SSL training — it only probes the representation the checkpoint already learned.
 
-Keep ``--n_probe_genera`` / ``--n_ssl_top`` identical across runs so the abele
-probe split (from ``assign_splits``) is fixed and stages are comparable. Point
-``--results_csv`` at the same file across stages to accumulate the scaling curve.
+Keep ``--n_probe_genera`` / ``--n_ssl_top`` / ``--max_files_per_species`` /
+``--max_files_per_genus`` identical across runs so the abele probe split (from
+``assign_splits``) is fixed and stages are comparable. Every one of them is
+recorded in ``--results_csv`` so a row is self-describing. Point ``--results_csv``
+at the same file across stages to accumulate the scaling curve.
+
+Accuracy is reported as a mean over ``--probe_repeats`` seeded probe fits. Compare
+runs only when their gap exceeds ``probe_val_acc_std``; below that it is probe
+initialisation noise, not the encoder.
 
 Usage:
     python eval/probe_checkpoint.py \\
@@ -66,13 +72,36 @@ def load_config(config_path):
 
 
 def append_result(results_csv: str, row: dict) -> None:
-    """Append one result row, writing a header first if the file is new."""
+    """Append one result row, writing a header first if the file is new.
+
+    The original five columns keep their names and positions so CSVs written by
+    earlier versions still parse; everything added since is appended after them.
+    """
     fieldnames = [
         "run_name",
         "ckpt_path",
         "n_probe_classes",
         "probe_val_acc",
         "probe_val_loss",
+        # spread across seeded repeats — a gap smaller than this is noise
+        "probe_val_acc_std",
+        # collapse diagnostics
+        "probe_val_acc_macro",
+        "probe_val_acc_macro_std",
+        "majority_acc",
+        "random_acc",
+        "n_pred_classes",
+        "probe_epochs",
+        # settings that must match for two rows to be comparable
+        "probe_seed",
+        "probe_repeats",
+        "n_probe_genera",
+        "n_ssl_top",
+        "probe_all",
+        "max_files_per_species",
+        "max_files_per_genus",
+        "n_probe_train_files",
+        "n_probe_val_files",
     ]
     is_new = not os.path.exists(results_csv) or os.path.getsize(results_csv) == 0
     with open(results_csv, "a", newline="") as f:
@@ -114,10 +143,41 @@ def main():
         "(ignores --n_probe_genera / --n_ssl_top). Richer eval, but slower and not "
         "comparable to the default 15-genera numbers.",
     )
+    # Probe class balance — see assign_splits' "Probe class balance" docstring.
+    # Uncapped, Escherichia coli's 48 files are 25% of probe_train but 2.3% of
+    # probe_val, which lets the probe collapse onto a near-useless class.
+    parser.add_argument(
+        "--max_files_per_species",
+        type=int,
+        default=3,
+        help="Cap files per species within each probe split (0 = no cap). Default "
+        "3, the modal abele count, which keeps probe train/val class balance "
+        "comparable at the cost of only the redundant E. coli replicates.",
+    )
+    parser.add_argument(
+        "--max_files_per_genus",
+        type=int,
+        default=0,
+        help="Additionally cap files per genus within each probe split (0 = no "
+        "cap). Set to balance the classes exactly, at roughly half the files.",
+    )
     # Probe hyperparameters (match eval/retrain_eval.py defaults).
     parser.add_argument("--probe_lr", type=float, default=1e-2)
     parser.add_argument("--probe_n_epochs", type=int, default=100)
     parser.add_argument("--probe_min_train_loss", type=float, default=0.3)
+    parser.add_argument(
+        "--probe_seed",
+        type=int,
+        default=0,
+        help="Seed for the probe initialisation. Repeat i uses probe_seed + i.",
+    )
+    parser.add_argument(
+        "--probe_repeats",
+        type=int,
+        default=3,
+        help="Probe fits over the same cached embeddings; the spread across them "
+        "is the noise floor for comparing two checkpoints. Default 3.",
+    )
     parser.add_argument(
         "--device",
         default=None,
@@ -137,6 +197,8 @@ def main():
         n_probe_genera=args.n_probe_genera,
         n_ssl_top=args.n_ssl_top,
         probe_all=args.probe_all,
+        max_files_per_species=args.max_files_per_species or None,
+        max_files_per_genus=args.max_files_per_genus or None,
     )
 
     # Load ONLY the probe files (skip the abele SSL corpus — not needed here).
@@ -172,7 +234,7 @@ def main():
     model.eval()
     model.to(device)
 
-    val_acc, val_loss = run_retrain_probe(
+    res = run_retrain_probe(
         model,
         probe_train_loader,
         probe_val_loader,
@@ -183,11 +245,17 @@ def main():
         n_epochs=args.probe_n_epochs,
         min_train_loss=args.probe_min_train_loss,
         device=device,
+        seed=args.probe_seed,
+        n_repeats=args.probe_repeats,
     )
 
     logger.info(
-        f"[{run_name}] probe_val_acc={val_acc:.4f}  probe_val_loss={val_loss:.4f} "
-        f"({num_probe_classes} classes)"
+        f"[{run_name}] probe_val_acc={res['val_acc']:.4f}±{res['val_acc_std']:.4f}  "
+        f"macro={res['val_acc_macro']:.4f}±{res['val_acc_macro_std']:.4f}  "
+        f"(majority={res['majority_acc']:.4f}, random={res['random_acc']:.4f}, "
+        f"{num_probe_classes} classes, "
+        f"{res['n_pred_classes']:.1f}/{num_probe_classes} classes predicted, "
+        f"{res['probe_epochs']:.0f} probe epochs)"
     )
 
     if args.results_csv:
@@ -197,8 +265,24 @@ def main():
                 "run_name": run_name,
                 "ckpt_path": args.ckpt_path,
                 "n_probe_classes": num_probe_classes,
-                "probe_val_acc": f"{val_acc:.6f}",
-                "probe_val_loss": f"{val_loss:.6f}",
+                "probe_val_acc": f"{res['val_acc']:.6f}",
+                "probe_val_loss": f"{res['val_loss']:.6f}",
+                "probe_val_acc_std": f"{res['val_acc_std']:.6f}",
+                "probe_val_acc_macro": f"{res['val_acc_macro']:.6f}",
+                "probe_val_acc_macro_std": f"{res['val_acc_macro_std']:.6f}",
+                "majority_acc": f"{res['majority_acc']:.6f}",
+                "random_acc": f"{res['random_acc']:.6f}",
+                "n_pred_classes": f"{res['n_pred_classes']:.1f}",
+                "probe_epochs": f"{res['probe_epochs']:.1f}",
+                "probe_seed": args.probe_seed,
+                "probe_repeats": args.probe_repeats,
+                "n_probe_genera": args.n_probe_genera,
+                "n_ssl_top": args.n_ssl_top,
+                "probe_all": int(args.probe_all),
+                "max_files_per_species": args.max_files_per_species,
+                "max_files_per_genus": args.max_files_per_genus,
+                "n_probe_train_files": len(probe_train_loader.dataset),
+                "n_probe_val_files": len(probe_val_loader.dataset),
             },
         )
         logger.info(f"Appended result to {args.results_csv}")

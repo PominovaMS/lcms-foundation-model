@@ -80,6 +80,21 @@ def main():
         help="Number of largest genera always reserved for SSL (default: 3)",
     )
     parser.add_argument(
+        "--max_files_per_species",
+        type=int,
+        default=3,
+        help="Cap files per species within each probe split (0 = no cap). Default "
+        "3, the modal abele count, which keeps the probe train/val class balance "
+        "comparable. Caps apply to the probe splits only; SSL keeps every file.",
+    )
+    parser.add_argument(
+        "--max_files_per_genus",
+        type=int,
+        default=0,
+        help="Additionally cap files per genus within each probe split (0 = no "
+        "cap). Set to balance the classes exactly, at roughly half the files.",
+    )
+    parser.add_argument(
         "--n_ssl_files",
         type=int,
         default=None,
@@ -109,7 +124,11 @@ def main():
     # Load and split metadata
     meta_df = load_metadata(args.meta_path)
     meta_df = assign_splits(
-        meta_df, n_probe_genera=args.n_probe_genera, n_ssl_top=args.n_ssl_top
+        meta_df,
+        n_probe_genera=args.n_probe_genera,
+        n_ssl_top=args.n_ssl_top,
+        max_files_per_species=args.max_files_per_species or None,
+        max_files_per_genus=args.max_files_per_genus or None,
     )
 
     # Only load files that will actually be used

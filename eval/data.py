@@ -3,6 +3,7 @@
 import logging
 import os
 
+import numpy as np
 import polars as pl
 import torch
 from depthcharge.data import SpectrumDataset, spectra_to_df, preprocessing
@@ -11,6 +12,17 @@ from torch.utils.data import DataLoader
 from source.dataset import LanceMapDataset, RunDataset
 
 logger = logging.getLogger(__name__)
+
+
+def stride(n: int, k: int) -> list[int]:
+    """``k`` indices evenly spaced across ``range(n)`` (deterministic, no RNG).
+
+    Mirrors ``scripts/mass_dist.py::stride`` (kept local so ``eval/`` does not
+    depend on ``scripts/``).
+    """
+    if k <= 0 or n <= k:
+        return list(range(n))
+    return sorted(set(np.linspace(0, n - 1, k).round().astype(int).tolist()))
 
 
 def load_metadata(meta_path: str) -> pl.DataFrame:
@@ -29,12 +41,55 @@ def load_metadata(meta_path: str) -> pl.DataFrame:
     return meta_df
 
 
+def _split_counts(meta_df: pl.DataFrame, split: str) -> dict[str, int]:
+    """Number of files per genus in one split."""
+    counts = meta_df.filter(pl.col("split") == split).group_by("genus").agg(
+        pl.len().alias("n")
+    )
+    return dict(zip(counts["genus"].to_list(), counts["n"].to_list()))
+
+
+def _cap_probe_files(
+    meta_df: pl.DataFrame, group_cols: list[str], cap: int
+) -> pl.DataFrame:
+    """Mark all but ``cap`` evenly-strided files per group as ``split="unused"``.
+
+    Only rows already in a probe split are considered — the SSL ("train") split is
+    never capped. Files are ordered by ``peak_file`` and sampled with :func:`stride`
+    rather than truncated, so the kept files spread across the acquisition order
+    instead of clustering in whatever batch happens to sort first.
+    """
+    probe_splits = ["probe_train", "probe_val"]
+    probe = meta_df.filter(pl.col("split").is_in(probe_splits))
+
+    groups: dict[tuple, list[str]] = {}
+    for row in probe.select([*group_cols, "peak_file"]).iter_rows():
+        groups.setdefault(row[:-1], []).append(row[-1])
+
+    keep: set[str] = set()
+    for files in groups.values():
+        files = sorted(files)
+        keep.update(files[i] for i in stride(len(files), cap))
+
+    return meta_df.with_columns(
+        pl.when(
+            pl.col("split").is_in(probe_splits)
+            & ~pl.col("peak_file").is_in(list(keep))
+        )
+        .then(pl.lit("unused"))
+        .otherwise(pl.col("split"))
+        .alias("split")
+    )
+
+
 def assign_splits(
     meta_df: pl.DataFrame,
     n_probe_genera: int = 15,
     min_species_per_genus: int = 2,
     n_ssl_top: int = 3,
     probe_all: bool = False,
+    max_files_per_species: int | None = 3,
+    max_files_per_genus: int | None = None,
 ) -> pl.DataFrame:
     """
     Deterministic split of files into SSL train and probe (train/val).
@@ -52,6 +107,21 @@ def assign_splits(
       between train (even index) and val (odd index).
     - genus_class is assigned 0..n-1 for probe genera (alphabetical by genus).
     - SSL files get genus_class = -1.
+
+    Probe class balance
+    -------------------
+    The species alternation above implicitly assumes species carry comparable
+    numbers of files. In abele they do not: 80 of the 87 probe species have 3
+    files, but *Escherichia coli* has 48 — and being alphabetically first it always
+    lands in probe_train. Uncapped, that single species is 25% of probe_train but
+    only 2.3% of probe_val, so a probe that collapses onto it scores *below* the
+    random rate. ``max_files_per_species`` (default 3, the modal count) caps each
+    species within each probe split, which drops the train-vs-val total variation
+    from 0.232 to 0.082. ``max_files_per_genus`` additionally caps each class, for
+    an exactly balanced probe at the cost of roughly half the files. Set either to
+    ``None`` or ``0`` to disable. Capping applies to the probe splits ONLY — the
+    SSL split keeps every file. Files dropped by a cap get ``split = "unused"``
+    (never ``"train"``, which would leak probe genera into the SSL corpus).
 
     The split is fully deterministic (no randomness). Ties in genus file count
     are broken alphabetically by genus name.
@@ -148,6 +218,15 @@ def assign_splits(
         .alias("genus_class")
     )
 
+    # --- cap files per species / per genus within the probe splits ---
+    n_probe_before = meta_df.filter(
+        pl.col("split").is_in(["probe_train", "probe_val"])
+    ).height
+    if max_files_per_species:
+        meta_df = _cap_probe_files(meta_df, ["split", "organism"], max_files_per_species)
+    if max_files_per_genus:
+        meta_df = _cap_probe_files(meta_df, ["split", "genus"], max_files_per_genus)
+
     # --- log summary ---
     ssl_df = meta_df.filter(pl.col("split") == "train")
     ssl_genus_counts = (
@@ -159,15 +238,28 @@ def assign_splits(
         f"(top: {', '.join(top_ssl)}, ...)"
     )
 
+    # Per-genus file counts AFTER capping, so the log reflects what the probe sees.
+    n_train_files = _split_counts(meta_df, "probe_train")
+    n_val_files = _split_counts(meta_df, "probe_val")
+    n_probe_files = sum(n_train_files.values()) + sum(n_val_files.values())
+    n_dropped = n_probe_before - n_probe_files
     logger.info(
-        f"Probe: {n_probe_genera} genera, "
-        f"{meta_df.filter(pl.col('split') != 'train').shape[0]} files"
+        f"Probe: {n_probe_genera} genera, {n_probe_files} files "
+        f"({sum(n_train_files.values())} train / {sum(n_val_files.values())} val)"
     )
-    for genus, n_files, n_sp, n_train, n_val in probe_genus_summary:
+    for genus, _n_files, n_sp, n_train, n_val in probe_genus_summary:
         cls = genus_to_class[genus]
         logger.info(
-            f"  [{cls}] {genus:<25s} ({n_files:>3d} files, {n_sp:>2d} sp) "
-            f"— train: {n_train} sp, val: {n_val} sp"
+            f"  [{cls}] {genus:<25s} ({n_sp:>2d} sp: {n_train} train / {n_val} val) "
+            f"— files: {n_train_files.get(genus, 0):>3d} train / "
+            f"{n_val_files.get(genus, 0):>3d} val"
+        )
+    if n_dropped:
+        logger.info(
+            f"Capped {n_dropped}/{n_probe_before} probe files to 'unused' "
+            f"(max_files_per_species={max_files_per_species}, "
+            f"max_files_per_genus={max_files_per_genus}) to keep the probe "
+            f"train/val class distributions comparable."
         )
 
     return meta_df
