@@ -1,12 +1,18 @@
 """Train the model."""  # Should this script be outside of the source folder (as a main entry point)?
 
 import argparse
-import math
+import json
 import os
 import yaml
 import pytorch_lightning as L
-from depthcharge.data import SpectrumDataset, spectra_to_df, preprocessing
+from depthcharge.data import SpectrumDataset, preprocessing
 from torch.utils.data import DataLoader
+from dataset import (
+    SpectrumIndexDataset,
+    batch_collate,
+    build_dataset,
+    iterable_steps_per_epoch,
+)
 from model import MS1Encoder
 from config import (
     ExperimentConfig,
@@ -32,7 +38,20 @@ def load_config(config_path):
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--data_dir", required=True, help="The path to the training data.")
+source_group = parser.add_mutually_exclusive_group(required=True)
+source_group.add_argument(
+    "--data_dir",
+    help="Directory of mzML to ingest, holding train_mzml/ and val_mzml/. Ingested "
+    "into a temporary Lance DB in FILE ORDER (unshuffled) and discarded when the run "
+    "ends. Prefer --lance_dir: it is shuffled and reusable.",
+)
+source_group.add_argument(
+    "--lance_dir",
+    help="Directory holding a prebuilt, pre-shuffled dataset from "
+    "scripts/build_lance.py (train.lance, val.lance, dataset_info.json). Skips "
+    "ingestion entirely, so every run over the same data starts from identical "
+    "spectra in identical order.",
+)
 parser.add_argument(
     "--config", default="../config.yaml", help="Path to configuration file"
 )
@@ -69,7 +88,24 @@ parser.add_argument(
     help="Override config.optimizer.warmup_iters (linear warmup length in optimizer "
     "steps). Raise it alongside --lr for large/heterogeneous training sets.",
 )
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=42,
+    help="Seeds the per-epoch batch shuffle (and torch/numpy generally), so a run is "
+    "reproducible.",
+)
+parser.add_argument(
+    "--no_shuffle",
+    action="store_true",
+    help="Read the training data in stored order instead of re-drawing batches each "
+    "epoch. Reproduces pre-shuffle runs.",
+)
 args = parser.parse_args()
+
+# Seed before anything stochastic: the batch shuffle, the peak masking, and the model
+# init all draw from these generators.
+L.seed_everything(args.seed, workers=True)
 
 # Load configuration
 config = load_config(args.config)
@@ -97,90 +133,123 @@ else:
     )
 
 # Load training data
-train_data_dir = os.path.join(args.data_dir, "train_mzml")
-val_data_dir = os.path.join(args.data_dir, "val_mzml")
+if args.lance_dir:
+    # Prebuilt, pre-shuffled dataset (scripts/build_lance.py). Rows are already in
+    # random order on disk, so the sequential Lance scan yields batches that are a
+    # cross-section of files and datasets — no loader-side shuffling needed.
+    info_path = os.path.join(args.lance_dir, "dataset_info.json")
+    try:
+        with open(info_path) as f:
+            dataset_info = json.load(f)
+    except FileNotFoundError:
+        raise SystemExit(
+            f"No dataset_info.json in {args.lance_dir}. Build the dataset with "
+            f"scripts/build_lance.py, which writes it alongside the .lance dirs."
+        )
+    # Preprocessing is applied at INGEST, so it is baked into the stored spectra.
+    # Training on a dataset built under a different peak cap would silently be a
+    # different experiment, so refuse rather than let it through.
+    built_peaks = dataset_info.get("preprocessing", {}).get("max_num_peaks")
+    if built_peaks != config.data.max_num_peaks:
+        raise SystemExit(
+            f"Preprocessing mismatch: {info_path} was built with "
+            f"max_num_peaks={built_peaks}, but the config asks for "
+            f"{config.data.max_num_peaks}. Rebuild with scripts/build_lance.py "
+            f"(preprocessing is baked in at ingest and cannot be changed after)."
+        )
+    train_dataset = SpectrumDataset.from_lance(
+        os.path.join(args.lance_dir, "train.lance"), BATCH_SIZE
+    )
+    val_dataset = SpectrumDataset.from_lance(
+        os.path.join(args.lance_dir, "val.lance"), BATCH_SIZE
+    )
+    print(
+        f"Prebuilt dataset {args.lance_dir}  shuffle_seed={dataset_info.get('seed')}  "
+        f"built={dataset_info.get('built_at')}  "
+        f"source={dataset_info.get('data_dir')}"
+    )
+else:
+    # Direct-ingest path: mzML into a temporary Lance DB, in sorted-filename order,
+    # rebuilt every run. Per-epoch shuffling still applies on top, so this is only
+    # the pathological one-file-per-batch case when combined with --no_shuffle.
+    print(
+        "NOTE: --data_dir re-parses every mzML into a temporary Lance DB and discards "
+        "it at the end of the run, and stores them in file order. Per-epoch batch "
+        "shuffling still applies, so batches are still cross-file — but with "
+        "--no_shuffle they would not be. scripts/build_lance.py + --lance_dir builds "
+        "once and reuses it."
+    )
+    preprocessing_fn = [
+        preprocessing.filter_intensity(max_num_peaks=config.data.max_num_peaks),
+        preprocessing.scale_intensity(scaling="root", max_intensity=1.0),
+    ]
+    train_dataset, _, _ = build_dataset(
+        os.path.join(args.data_dir, "train_mzml"), preprocessing_fn, BATCH_SIZE
+    )
+    val_dataset, _, _ = build_dataset(
+        os.path.join(args.data_dir, "val_mzml"), preprocessing_fn, BATCH_SIZE
+    )
 
-preprocessing_fn = [
-    preprocessing.filter_intensity(max_num_peaks=config.data.max_num_peaks),
-    preprocessing.scale_intensity(scaling="root", max_intensity=1.0),
-]
-
-def build_dataset(data_dir, preprocessing_fn, batch_size):
-    """Build a SpectrumDataset by streaming one mzML into Lance at a time.
-
-    Appending per file (depthcharge's `add_spectra`, mode="append") keeps only a
-    single file's DataFrame in RAM, so peak memory scales with one file instead of
-    the whole corpus — the previous `pl.concat` of every file did not scale to a
-    full dataset (hundreds of ~195k-spectra files).
-    """
-    # Only feed mzML to the parser. depthcharge dispatches a parser by extension, and
-    # its MGF parser is MS2-only ("ms_level 1 is currently not supported") — so a stray
-    # .mgf (or any non-mzML) symlinked into the dir would crash MS1 ingestion. Match the
-    # `.mzml` convention used by the stage builders and peak_stats.py.
-    all_entries = sorted(os.listdir(data_dir))
-    mzml_files = [f for f in all_entries if f.lower().endswith((".mzml", ".mzml.gz"))]
-    skipped = [f for f in all_entries if f not in mzml_files]
-    if skipped:
-        print(f"Skipping {len(skipped)} non-mzML file(s) in {data_dir}: {skipped}")
-
-    ds = None
-    corrupt = []
-    for mzml_file in mzml_files:
-        try:
-            df = spectra_to_df(
-                os.path.join(data_dir, mzml_file),
-                metadata_df=None,
-                ms_level=1,
-                preprocessing_fn=preprocessing_fn,
-                valid_charge=None,
-                custom_fields=None,
-                progress=True,
-            )
-        except Exception as e:  # corrupt/truncated mzML — skip so one bad file
-            corrupt.append(mzml_file)  # doesn't kill a long run mid-build
-            print(f"WARNING: skipping unreadable mzML {mzml_file} ({type(e).__name__}: {e})")
-            continue
-        if ds is None:
-            ds = SpectrumDataset(df, batch_size=batch_size)
-        else:
-            ds.add_spectra(df)
-        del df  # free this file before loading the next
-    if corrupt:
-        # Conspicuous summary so a systemic conversion problem can't hide behind
-        # per-file warnings scrolled off the log.
-        print(f"WARNING: skipped {len(corrupt)}/{len(mzml_files)} unreadable mzML "
-              f"file(s) in {data_dir}: {corrupt}")
-    if ds is None:
-        raise SystemExit(f"No readable mzML files in {data_dir}")
-    return ds
-
-
-train_dataset = build_dataset(train_data_dir, preprocessing_fn, BATCH_SIZE)
-val_dataset = build_dataset(val_data_dir, preprocessing_fn, BATCH_SIZE)
 print("N train spectra", train_dataset.n_spectra)
 print("N val spectra:", val_dataset.n_spectra)
+print(
+    f"batch shuffling: {'OFF (stored order)' if args.no_shuffle else 'per-epoch'}  "
+    f"seed={args.seed}"
+)
 
-# Resolve the length of the one-cycle LR schedule. We can't use
-# trainer.estimated_stepping_batches here because SpectrumDataset is an
-# IterableDataset with no __len__, so compute it from n_spectra / batch_size.
-steps_per_epoch = math.ceil(train_dataset.n_spectra / BATCH_SIZE)
-# OneCycleLR raises once it is stepped past total_steps, so the schedule must be at
-# least as long as the run. With --max_steps the count is exact (Lightning stops there),
-# so use it as-is and let LR anneal fully. The epochs path is an estimate that can be
-# off by a batch or two, so pad it: an undercount would kill a multi-day run, and the
-# only cost of overshooting is that LR stops a hair above its floor.
-SCHEDULE_MARGIN = 1.02
+if args.no_shuffle:
+    # Sequential scan in stored order. With a --lance_dir dataset that order is
+    # already random, so batches stay cross-file; they just don't change per epoch.
+    # With --data_dir it is file order, which is the sawtooth case.
+    train_loader = DataLoader(train_dataset, batch_size=None, num_workers=0)
+else:
+    # Re-draw batches every epoch. DataLoader's RandomSampler does the shuffling;
+    # SpectrumIndexDataset only exists because SpectrumDataset is an IterableDataset
+    # and PyTorch refuses `shuffle=True` on those. One lance `take` per step.
+    train_loader = DataLoader(
+        SpectrumIndexDataset(train_dataset),
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=0,  # the dataset holds a live Lance handle; not fork-safe
+        collate_fn=batch_collate(train_dataset),
+    )
+# Validation is NEVER reshuffled. `validation_step` seeds its mask generator with
+# `42 + batch_idx` so masks are identical across epochs — which only holds if batch k
+# is the same spectra every time. Shuffling here would add noise to val loss and make
+# epoch-to-epoch comparisons meaningless.
+val_loader = DataLoader(val_dataset, batch_size=None, num_workers=0)
+
+# Resolve the length of the one-cycle LR schedule. OneCycleLR raises once it is
+# stepped past total_steps, so this has to be exact, not approximately right.
+#
+# The model prefers `trainer.estimated_stepping_batches` (which knows the real
+# dataloader length, accumulate_grad_batches, limit_train_batches and max_steps).
+# What is computed here is the fallback for when that is unavailable — an unsized
+# IterableDataset — plus the startup diagnostics.
+if args.no_shuffle:
+    # NOT ceil(n_spectra / BATCH_SIZE): Lance batches never span fragments, so each
+    # mzML file / write chunk adds a partial batch. That formula undercounted by up
+    # to ~27% on many-file sets, which is what made OneCycleLR raise mid-run.
+    steps_per_epoch = iterable_steps_per_epoch(train_dataset, BATCH_SIZE)
+    derivation = "exact (per-fragment sum)"
+else:
+    # Map-style loader: len() is the true steps/epoch.
+    steps_per_epoch = len(train_loader)
+    derivation = "exact (len(train_loader))"
+
 if MAX_STEPS != -1:
     total_steps = MAX_STEPS
     derivation = "exact (--max_steps)"
-    total_steps_sched = total_steps
 else:
     total_steps = steps_per_epoch * MAX_EPOCHS
-    derivation = "estimated from n_spectra, padded"
-    total_steps_sched = math.ceil(total_steps * SCHEDULE_MARGIN) + 10
-if config.optimizer.total_steps:
+total_steps_sched = total_steps
+
+# An explicit config value overrides the derivation, and also stops the model from
+# preferring the trainer's estimate over it.
+auto_total_steps = config.optimizer.total_steps is None
+if not auto_total_steps:
     total_steps_sched = config.optimizer.total_steps
-    derivation = "from config"
+    derivation = "from config (override)"
 print(
     f"steps/epoch={steps_per_epoch}  total_steps={total_steps}  "
     f"schedule_total_steps={total_steps_sched} ({derivation})"
@@ -191,9 +260,6 @@ print(
     f"{' (CLI)' if args.warmup_iters is not None else ' (config)'}  "
     f"pct_start={WARMUP_ITERS / total_steps_sched:.4g}"
 )
-
-train_loader = DataLoader(train_dataset, batch_size=None, num_workers=0)
-val_loader = DataLoader(val_dataset, batch_size=None, num_workers=0)
 
 root_dir = os.path.join(CHECKPOINT_PATH, "foundation_model")
 os.makedirs(root_dir, exist_ok=True)
@@ -231,6 +297,7 @@ model = MS1Encoder(
     lr=LR,
     warmup_iters=WARMUP_ITERS,
     total_steps=total_steps_sched,
+    auto_total_steps=auto_total_steps,
     div_factor=config.optimizer.div_factor,
     final_div_factor=config.optimizer.final_div_factor,
 )

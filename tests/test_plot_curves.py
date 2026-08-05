@@ -1,7 +1,8 @@
 """Tests for the curve smoothing in scripts/plot_curves.py.
 
-Only ``ema_smooth`` is exercised — it is the one piece of the plotting script with
-behaviour worth pinning down. Everything else there is matplotlib calls and I/O.
+Only ``ema_smooth`` and ``should_smooth`` are exercised — they are the pieces of the
+plotting script with behaviour worth pinning down. Everything else there is matplotlib
+calls and I/O.
 """
 
 import math
@@ -12,7 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from plot_curves import ema_smooth  # noqa: E402
+from plot_curves import ema_smooth, should_smooth  # noqa: E402
 
 WEIGHT = 0.9
 
@@ -62,3 +63,35 @@ def test_nan_passes_through_without_poisoning_the_tail():
     assert math.isnan(smoothed[2])
     assert all(math.isfinite(v) for i, v in enumerate(smoothed) if i != 2)
     assert smoothed[-1] == pytest.approx(1.0)
+
+
+# --- should_smooth: which curves get a trend line ------------------------------
+
+
+@pytest.mark.parametrize("tag", ["val_loss", "val_acc_mz_bin", "online_val_loss"])
+@pytest.mark.parametrize("n_points", [50, 500, 100_000])
+def test_val_is_never_smoothed_at_any_length(tag, n_points):
+    """Val is per-epoch by construction, so length must not buy it a trend line.
+
+    A flat 50-point threshold used to let a 50-epoch ``val_loss`` through, and the EMA
+    lag then distorted it by ~30% of its dynamic range.
+    """
+    assert not should_smooth(tag, "loss", n_points, WEIGHT, min_points=50)
+
+
+def test_train_of_the_same_length_is_smoothed():
+    """The exclusion is about val specifically, not about short series."""
+    assert should_smooth("train_loss", "loss", 50, WEIGHT, min_points=50)
+
+
+def test_short_series_still_gated_by_min_points():
+    assert not should_smooth("train_loss", "loss", 49, WEIGHT, min_points=50)
+
+
+def test_smooth_zero_disables_everything():
+    assert not should_smooth("train_loss", "loss", 5000, 0, min_points=50)
+
+
+def test_lr_panel_is_never_smoothed():
+    """The lr panel is deterministic — smoothing would misrepresent the schedule."""
+    assert not should_smooth("lr", "lr", 5000, WEIGHT, min_points=50)

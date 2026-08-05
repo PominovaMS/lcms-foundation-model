@@ -107,6 +107,54 @@ def test_one_cycle_keeps_adam_betas():
     assert optimizer.param_groups[0]["betas"] == (0.9, 0.98)
 
 
+class _FakeTrainer:
+    def __init__(self, estimated):
+        self.estimated_stepping_batches = estimated
+
+
+def _with_trainer(model, estimated):
+    """Attach a stand-in trainer; configure_optimizers reads only this one property."""
+    model._trainer = _FakeTrainer(estimated)
+    return model
+
+
+def _tiny(**kw):
+    return MS1Encoder(d_model=8, nhead=1, dim_feedforward=12, n_layers=1, **kw)
+
+
+def test_total_steps_prefers_the_trainer_estimate():
+    """Lightning knows the real dataloader length; a formula in train.py does not.
+
+    Getting this wrong made OneCycleLR raise "Tried to step N times" mid-run.
+    """
+    model = _with_trainer(_tiny(warmup_iters=10, total_steps=999), estimated=250)
+    scheduler = model.configure_optimizers()["lr_scheduler"]["scheduler"]
+    assert scheduler.total_steps == 250
+
+
+def test_total_steps_falls_back_without_a_trainer():
+    model = _tiny(warmup_iters=10, total_steps=250)
+    scheduler = model.configure_optimizers()["lr_scheduler"]["scheduler"]
+    assert scheduler.total_steps == 250
+
+
+@pytest.mark.parametrize("estimated", [float("inf"), -1, 0])
+def test_total_steps_falls_back_when_the_estimate_is_unusable(estimated):
+    """Unsized IterableDataset gives inf, or max_steps (-1) when that isn't set."""
+    model = _with_trainer(_tiny(warmup_iters=10, total_steps=250), estimated)
+    scheduler = model.configure_optimizers()["lr_scheduler"]["scheduler"]
+    assert scheduler.total_steps == 250
+
+
+def test_explicit_config_override_beats_the_trainer_estimate():
+    """`optimizer.total_steps` in the config is a documented escape hatch."""
+    model = _with_trainer(
+        _tiny(warmup_iters=10, total_steps=777, auto_total_steps=False), estimated=250
+    )
+    scheduler = model.configure_optimizers()["lr_scheduler"]["scheduler"]
+    assert scheduler.total_steps == 777
+
+
 def test_legacy_schedule_hparam_still_loads():
     """Checkpoints predating OneCycleLR saved the schedule length under the old name.
 

@@ -39,23 +39,92 @@ a stable hash of `seed:filename`, so a file keeps its assignment across stages a
 earlier stages are never reshuffled. Re-running is idempotent (use `--force` to
 replace existing symlinks).
 
-### 2. Pretrain the foundation model per stage
+### 2. Build a pre-shuffled dataset — `build_lance.py`
 
-Each stage dir is consumed directly by `source/train.py`. Give every stage a
-distinct `--run_name` so its logs + checkpoints land in their own directory (and
-stages don't overwrite each other):
+Parses the stage's mzML into a Lance database **once**, in random order, and keeps
+it on disk.
+
+```bash
+python scripts/build_lance.py \
+    --data_dir /mnt/data/shared/lc_ms_foundation/training_sets/sweep/stage03 \
+    --out      /mnt/data/shared/lc_ms_foundation/training_sets/sweep/stage03/lance \
+    --seed 42
+# -> <out>/{train.lance, val.lance, dataset_info.json}
+```
+
+**Why the shuffle is on disk.** Lance scans sequentially and ingest walks files in
+sorted-name order, so unshuffled training replays an identical sequence every epoch
+and every batch of 1024 comes from a single ~195k-spectrum file. That shows up as a
+loss sawtooth locked to position within the epoch. Shuffling the rows physically
+makes each batch a cross-section of files and datasets, costs nothing at training
+time (still a sequential scan — no random reads), and leaves the batch format alone.
+
+**Why it is persistent.** Without this, every run re-parses the whole corpus into a
+temporary Lance DB and discards it. Build once, then sweep hyperparameters against
+byte-identical data. The same `--seed` reproduces the same on-disk order.
+
+The order is fixed on disk, so each epoch sees the same batch composition — the
+shuffle is global but not re-drawn per epoch. That is the tradeoff that makes the
+data reusable.
+
+| flag | default | notes |
+| --- | --- | --- |
+| `--seed` | `42` | Shuffle seed; part of the experiment, so record it if you change it. |
+| `--chunk-size` | `50000` | Spectra per write chunk. Bounds peak RAM during the shuffle; lower it if the build OOMs. |
+| `--force` | off | Rebuild an existing output. Without it, a complete build is a no-op. |
+
+**Disk:** staging and shuffled output coexist during the build, so it transiently
+needs ~2x the final size (~11 GB for 3.5M spectra, so budget ~22 GB). Staging is
+removed on success.
+
+**Preprocessing is baked in.** `filter_intensity(max_num_peaks=...)` and the sqrt
+scaling are applied at ingest, so a dataset built under one peak cap cannot be
+reused under another. `dataset_info.json` records the value and `train.py` refuses
+to start on a mismatch — rebuild instead. The sidecar also records the seed, the
+spectra counts, and the exact file list per split, so a run can always be traced
+back to its data.
+
+### 3. Pretrain the foundation model per stage
+
+Point `train.py` at the prebuilt dataset. Give every stage a distinct `--run_name`
+so its logs + checkpoints land in their own directory (and stages don't overwrite
+each other):
 
 ```bash
 cd source && python train.py \
-    --data_dir /mnt/data/shared/lc_ms_foundation/training_sets/sweep/stage03 \
+    --lance_dir /mnt/data/shared/lc_ms_foundation/training_sets/sweep/stage03/lance \
     --config ../config.yaml \
     --run_name stage03
 ```
 
+`--data_dir <stage dir>` still works and ingests mzML directly, but it is
+**unshuffled** — kept only to reproduce runs made before the shuffle existed.
+
+**Two shuffles, two jobs — both are on by default.**
+
+| | what it does | when |
+| --- | --- | --- |
+| `build_lance.py --seed` | randomises the **stored** order, so batches are a cross-section of files and datasets | once, at build |
+| `train.py` batch shuffling | **re-draws** batches, so each epoch sees a different partition | every epoch |
+
+The first makes the dataset reusable and fixes batches being one-file-at-a-time; the
+second stops all 50 epochs training on the identical 2097 groupings. `--no_shuffle`
+turns the second off (batches stay cross-file, because the stored order is already
+random) and `--seed` makes it reproducible.
+
+Per-epoch shuffling reads each batch with one random `take` instead of a sequential
+scan. Measured cost is ~40 ms/batch on top of a ~675 ms/step baseline (~6%); it is
+one `take` per *step*, not per row, which is what keeps it cheap.
+
+**Validation is never reshuffled.** `validation_step` seeds its masking with
+`42 + batch_idx` so masks are identical across epochs — which only holds if batch *k*
+is the same spectra every time. Shuffling val would add noise to val loss and make
+epoch-to-epoch comparisons meaningless.
+
 Checkpoints (including a stable `last.ckpt`) are written under
 `train_checkpoints/foundation_model/lightning_logs/<run_name>/checkpoints/`.
 
-### 3. Evaluate each checkpoint downstream — `eval/probe_checkpoint.py`
+### 4. Evaluate each checkpoint downstream — `eval/probe_checkpoint.py`
 
 Loads a pretrained checkpoint, freezes the encoder, trains a fresh linear probe on
 the abele genus task, and reports validation accuracy. Point `--results_csv` at the
@@ -160,13 +229,21 @@ TensorBoard-style EMA (bias-corrected) over the top carrying the trend:
 | flag | default | effect |
 | --- | --- | --- |
 | `--smooth` | `0.9` | EMA weight. `0` disables it and plots the raw curves alone; `0.98` for a long, noisy run. |
-| `--smooth-min-points` | `50` | Only smooth series with at least this many points, which leaves the per-epoch curves (`val_*`, and the `retrain_*` / `online_*` probe metrics — already means over a whole loader) raw. |
+| `--smooth-min-points` | `50` | Only smooth series with at least this many points, which leaves the short per-epoch `retrain_*` / `online_*` probe metrics raw. |
 
-The `lr` panel is never smoothed: it is deterministic, and checking the schedule shape is
-what that panel is for.
+**Val curves are never smoothed**, whatever those flags say. They are logged once per epoch
+and are already a mean over the whole validation set, so there is no batch-to-batch noise
+to remove and an EMA would only add lag — on a 50-epoch run that lag was distorting
+`val_loss` by ~30% of its dynamic range. The `lr` panel is never smoothed either: it is
+deterministic, and checking the schedule shape is what that panel is for.
 
 One thing to keep in mind when reading a train-vs-val gap: an EMA is causal, so on a
-falling curve the smoothed line sits slightly *above* the raw values (~`1/(1-weight)`
-points of lag — about 10 logged points at 0.9). Part of any apparent train-above-val gap
-early in a run is that lag, not the model. The faint raw trace underneath is what to check
-it against.
+falling curve the smoothed train line sits slightly *above* the raw values
+(~`1/(1-weight)` points of lag — about 10 logged points at 0.9). Part of any apparent
+train-above-val gap early in a run is that lag, not the model. The faint raw trace
+underneath is what to check it against.
+
+If the train trend line still looks spiky at a *regular* period, that is not noise the EMA
+failed to remove — it is epoch structure. `source/train.py` feeds spectra in fixed file
+order with no shuffling, so every epoch replays the same sequence and per-file difficulty
+shows up as a sawtooth. Turning `--smooth` up hides it rather than fixing it.

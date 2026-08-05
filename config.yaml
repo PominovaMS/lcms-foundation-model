@@ -27,12 +27,12 @@ optimizer:
   lr: 0.0005 # 0.0003  — peak LR of the one-cycle schedule
   warmup_iters: 2000  # diverse data: gentler start to avoid early loss spikes
   # Length of the OneCycleLR schedule in optimizer steps. It must be at least the
-  # run's TOTAL steps: OneCycleLR raises once stepped past it.
-  # `null` = derive in train.py from the run's stop criterion:
-  #   --max_steps if given (exact, used as-is), else
-  #   ceil(n_train_spectra / batch_size) * max_epochs padded ~2%, because that
-  #   spectra-count estimate can be off by a batch or two and an undercount raises.
-  # Set an explicit int here only to override the derivation for an experiment.
+  # run's TOTAL steps: OneCycleLR raises mid-run once stepped past it.
+  # `null` (recommended) = the model takes trainer.estimated_stepping_batches, which
+  # knows the real dataloader length; train.py's own exact count is the fallback for
+  # the unsized --no_shuffle path. Do NOT hand-compute this as n_spectra/batch_size
+  # — see the total_steps note in CLAUDE.md for why that undercounts.
+  # An explicit int here overrides both, for an experiment that needs a fixed schedule.
   total_steps: null
   div_factor: 25.0          # start LR = lr / 25
   final_div_factor: 10000.0 # final LR = start LR / 1e4

@@ -30,6 +30,7 @@ class MS1Encoder(L.LightningModule):
         lr=5e-4,
         warmup_iters=1000,
         total_steps=32000,
+        auto_total_steps=True,
         div_factor=25.0,
         final_div_factor=1e4,
         cosine_schedule_period_iters=None,
@@ -302,33 +303,56 @@ class MS1Encoder(L.LightningModule):
 
         return loss
 
+    def _resolve_total_steps(self):
+        """How many optimizer steps the run will actually take.
+
+        ``OneCycleLR`` raises once stepped past ``total_steps``, so this has to be
+        right, not approximately right. Lightning's ``estimated_stepping_batches`` is
+        the authority — it knows the real dataloader length plus
+        ``accumulate_grad_batches``, ``limit_train_batches``, ``max_steps`` and the
+        device count, none of which a formula in ``train.py`` tracks.
+
+        It is not always usable: it returns ``inf``/``max_steps`` (i.e. ``-1``) for an
+        unsized ``IterableDataset``, and there is no trainer at all when
+        ``configure_optimizers`` is called directly. Both fall back to the
+        ``total_steps`` hparam, which ``train.py`` computes exactly for those cases.
+        An explicit ``optimizer.total_steps`` in the config sets
+        ``auto_total_steps=False`` and always wins.
+        """
+        fallback = self.hparams.total_steps
+        if not self.hparams.auto_total_steps or self._trainer is None:
+            return fallback, "hparams.total_steps"
+
+        estimated = self.trainer.estimated_stepping_batches
+        if not np.isfinite(estimated) or estimated <= 0:
+            # Unsized IterableDataset with no --max_steps.
+            return fallback, "hparams.total_steps (trainer estimate unavailable)"
+        return int(estimated), "trainer.estimated_stepping_batches"
+
     def configure_optimizers(
         self,
     ):
-        """Adam + a one-cycle LR schedule (warmup to ``lr``, then cosine anneal).
-
-        ``total_steps`` must be at least the number of optimizer steps the run will
-        take: ``OneCycleLR`` raises once stepped past it. ``train.py`` derives it from
-        the run's stop criterion and pads it slightly for that reason.
-        """
+        """Adam + a one-cycle LR schedule (warmup to ``lr``, then cosine anneal)."""
         optimizer = torch.optim.Adam(
             self.parameters(), lr=self.hparams.lr, betas=(0.9, 0.98)
         )
+        total_steps, source = self._resolve_total_steps()
+        print(f"OneCycleLR total_steps={total_steps} (from {source})")
         # Warmup is configured in steps (the CLI and slurm scripts speak steps);
         # OneCycleLR wants it as a fraction of the cycle.
-        raw_pct = self.hparams.warmup_iters / self.hparams.total_steps
+        raw_pct = self.hparams.warmup_iters / total_steps
         pct_start = min(max(raw_pct, 1e-3), 0.5)
         if pct_start != raw_pct:
             warnings.warn(
                 f"warmup_iters={self.hparams.warmup_iters} is "
-                f"{raw_pct:.4g} of total_steps={self.hparams.total_steps}; "
+                f"{raw_pct:.4g} of total_steps={total_steps}; "
                 f"clamped pct_start to {pct_start:g} (must be in (0, 1)).",
                 stacklevel=2,
             )
         self.lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=self.hparams.lr,
-            total_steps=self.hparams.total_steps,
+            total_steps=total_steps,
             pct_start=pct_start,
             anneal_strategy="cos",
             div_factor=self.hparams.div_factor,

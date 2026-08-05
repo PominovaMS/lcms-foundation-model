@@ -53,6 +53,11 @@ PROBE_REPEATS=3           # accuracy is the mean over this many seeded probe fit
 # different labs don't spike the loss before the schedule has ramped.
 LR=5e-4
 WARMUP_ITERS=6000
+SHUFFLE_SEED=42   # seeds the on-disk shuffle of the training data (step 2).
+                  # Fixed across a sweep so every stage differs only in its data.
+TRAIN_SEED=42     # seeds training itself (step 3): the per-epoch batch shuffle, the
+                  # peak masking, and model init. Also fixed across a sweep, for the
+                  # same reason — vary it only to measure run-to-run variance.
 
 RUN_TAG=lim5x25_ep50_lr5e-4        # optional label to separate runs of the SAME stage (e.g. "lim25_ep50").
                 # Keeps checkpoints, logs, and results from colliding/overwriting.
@@ -63,6 +68,7 @@ RUN_TAG=lim5x25_ep50_lr5e-4        # optional label to separate runs of the SAME
 STAGE_NUM="${SLURM_ARRAY_TASK_ID:-1}"
 STAGE=$(printf "stage%02d" "$STAGE_NUM")
 STAGE_DIR="$SWEEP_ROOT/$STAGE"
+LANCE_DIR="$STAGE_DIR/lance"   # persistent pre-shuffled dataset (see step 2)
 RUN="$STAGE${RUN_TAG:+_$RUN_TAG}"
 CKPT="$REPO/source/train_checkpoints/foundation_model/lightning_logs/$RUN/checkpoints/last.ckpt"
 
@@ -74,13 +80,27 @@ rm -rf "$STAGE_DIR"
     --accessions "${ACCESSIONS[@]}" \
     ${LIMIT:+--limit "$LIMIT"}
 
-# 2) Pretrain (train.py runs from source/, so checkpoints land under source/).
+# 2) Ingest into a persistent, PRE-SHUFFLED Lance dataset.
+#    Shuffling on disk is what makes a batch a cross-section of files rather than a
+#    slice of one mzML (unshuffled, the loss shows a sawtooth locked to position
+#    within the epoch). It is also built once and reused, so re-running this stage
+#    with different hyperparameters no longer re-parses the whole corpus — and every
+#    such run trains on byte-identical data.
+#    Rebuilt here because step 1 just regenerated STAGE_DIR; drop --force to reuse an
+#    existing build. SHUFFLE_SEED is part of the experiment: record it if you change it.
+"$ENV/bin/python" scripts/build_lance.py \
+    --data_dir "$STAGE_DIR" --out "$LANCE_DIR" --config config.yaml \
+    --seed "$SHUFFLE_SEED" --force
+
+# 3) Pretrain (train.py runs from source/, so checkpoints land under source/).
+#    Batches are re-drawn every epoch (--seed makes that reproducible); pass
+#    --no_shuffle to reproduce a pre-shuffle run.
 ( cd source && "$ENV/bin/python" train.py \
-    --data_dir "$STAGE_DIR" --config ../config.yaml \
-    --run_name "$RUN" --max_epochs "$MAX_EPOCHS" \
+    --lance_dir "$LANCE_DIR" --config ../config.yaml \
+    --run_name "$RUN" --max_epochs "$MAX_EPOCHS" --seed "$TRAIN_SEED" \
     ${LR:+--lr "$LR"} ${WARMUP_ITERS:+--warmup_iters "$WARMUP_ITERS"} )
 
-# 3) Probe the checkpoint on abele -> one row in results/<run>.csv.
+# 4) Probe the checkpoint on abele -> one row in results/<run>.csv.
 #    Results stay in a PER-RUN file: this script reads SLURM_ARRAY_TASK_ID, so it
 #    can run as an array, and concurrent appends to one shared CSV on networked
 #    storage are not guaranteed atomic. Every row records its own split settings,

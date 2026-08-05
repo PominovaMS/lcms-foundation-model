@@ -7,9 +7,11 @@ directories, pulls those scalars out of the event files, and writes a PNG with t
 stacked panels (loss, accuracy, lr). Pass several run dirs to overlay them — handy for
 comparing data-diversity stages on the same axes.
 
-The per-step curves are dominated by batch-to-batch noise, so they are drawn twice: the
-raw values as a faint trace and a TensorBoard-style EMA on top carrying the trend (see
-``ema_smooth``). ``--smooth 0`` turns that off and plots the raw values alone.
+The per-step train curves are dominated by batch-to-batch noise, so they are drawn twice:
+the raw values as a faint trace and a TensorBoard-style EMA on top carrying the trend (see
+``ema_smooth``). ``--smooth 0`` turns that off and plots the raw values alone. Val curves
+are never smoothed — they are logged once per epoch and are already a mean over the whole
+validation set, so an EMA would add lag without removing any noise.
 
 Reading the events needs only ``tensorboard`` (already a dependency of
 ``TensorBoardLogger``); TensorFlow is not required.
@@ -92,6 +94,25 @@ def ema_smooth(values, weight: float) -> list[float]:
     return out
 
 
+def should_smooth(
+    tag: str, panel_name: str, n_points: int, weight: float, min_points: int
+) -> bool:
+    """Whether ``tag``'s curve gets an EMA trend line drawn over its raw values.
+
+    Val curves never do: they are logged once per epoch and are already a mean over
+    the whole validation set, so there is no batch-to-batch noise to remove and an EMA
+    would only add lag. That is decided by kind, not by point count — val is per-epoch
+    however many epochs a run happens to have. The ``lr`` panel is excluded too, being
+    deterministic. ``min_points`` then keeps the remaining short per-epoch series (the
+    ``retrain_*`` / ``online_*`` probe metrics) raw.
+    """
+    if panel_name not in SMOOTHED_PANELS or weight <= 0:
+        return False
+    if "val" in tag.lower():
+        return False
+    return n_points >= min_points
+
+
 def find_event_dirs(run_dir: str) -> list[str]:
     """Directories under ``run_dir`` that hold event files (incl. version_N/)."""
     dirs = []
@@ -145,9 +166,9 @@ def main():
         "--smooth-min-points",
         type=int,
         default=50,
-        help="Only smooth series with at least this many points. Keeps the per-epoch "
-        "curves (val_*, and the retrain_*/online_* probe metrics, which are already "
-        "means over a whole loader) raw, and smooths the noisy per-step ones.",
+        help="Only smooth series with at least this many points, which keeps the "
+        "short per-epoch curves (the retrain_*/online_* probe metrics) raw. Val "
+        "curves are never smoothed regardless of this setting.",
     )
     args = parser.parse_args()
     if not 0 <= args.smooth < 1:
@@ -185,10 +206,8 @@ def main():
                     color = run_color
                     style = "--" if is_val else "-"
                 lbl = tag if len(runs) == 1 else f"{run_name}:{tag}"
-                smooth = (
-                    panel_name in SMOOTHED_PANELS
-                    and args.smooth > 0
-                    and len(steps) >= args.smooth_min_points
+                smooth = should_smooth(
+                    tag, panel_name, len(steps), args.smooth, args.smooth_min_points
                 )
                 if smooth:
                     # Raw values as an unlabelled ghost so the legend keeps exactly one
