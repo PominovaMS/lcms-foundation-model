@@ -68,12 +68,16 @@ RUN_TAG=lim5x25_ep50_lr5e-4        # optional label to separate runs of the SAME
 STAGE_NUM="${SLURM_ARRAY_TASK_ID:-1}"
 STAGE=$(printf "stage%02d" "$STAGE_NUM")
 STAGE_DIR="$SWEEP_ROOT/$STAGE"
-LANCE_DIR="$STAGE_DIR/lance"   # persistent pre-shuffled dataset (see step 2)
+# Deliberately OUTSIDE STAGE_DIR: step 1 does `rm -rf "$STAGE_DIR"`, which would
+# otherwise delete the prebuilt dataset before it could ever be reused.
+LANCE_DIR="$SWEEP_ROOT/lance/$STAGE"
 RUN="$STAGE${RUN_TAG:+_$RUN_TAG}"
 CKPT="$REPO/source/train_checkpoints/foundation_model/lightning_logs/$RUN/checkpoints/last.ckpt"
 
 # 1) Build the mixed training set from ALL accessions (one combined train/val set).
-#    Clear first so the dir (a regenerable symlink farm) reflects the current LIMIT.
+#    Clear first so the dir (a regenerable symlink farm — cheap) reflects the current
+#    LIMIT. Symlink names are the original mzML names and the train/val split is a
+#    stable hash, so regenerating it is a no-op as far as step 2 is concerned.
 rm -rf "$STAGE_DIR"
 "$ENV/bin/python" scripts/build_stage.py \
     --root "$PRIDE_ROOT" --out-root "$STAGE_DIR" \
@@ -83,14 +87,17 @@ rm -rf "$STAGE_DIR"
 # 2) Ingest into a persistent, PRE-SHUFFLED Lance dataset.
 #    Shuffling on disk is what makes a batch a cross-section of files rather than a
 #    slice of one mzML (unshuffled, the loss shows a sawtooth locked to position
-#    within the epoch). It is also built once and reused, so re-running this stage
-#    with different hyperparameters no longer re-parses the whole corpus — and every
-#    such run trains on byte-identical data.
-#    Rebuilt here because step 1 just regenerated STAGE_DIR; drop --force to reuse an
-#    existing build. SHUFFLE_SEED is part of the experiment: record it if you change it.
+#    within the epoch).
+#    NO --force: the script compares the mzML file list, the seed and max_num_peaks
+#    against what it recorded last time, so re-running this stage with different
+#    hyperparameters skips ingestion entirely and trains on byte-identical data,
+#    while a change to ACCESSIONS or LIMIT rebuilds automatically. Step 1 regenerating
+#    the symlink farm does NOT force a rebuild — the file names are stable.
+#    Add --force to rebuild regardless (e.g. an mzML was replaced in place).
+#    SHUFFLE_SEED is part of the experiment: record it if you change it.
 "$ENV/bin/python" scripts/build_lance.py \
     --data_dir "$STAGE_DIR" --out "$LANCE_DIR" --config config.yaml \
-    --seed "$SHUFFLE_SEED" --force
+    --seed "$SHUFFLE_SEED"
 
 # 3) Pretrain (train.py runs from source/, so checkpoints land under source/).
 #    Batches are re-drawn every epoch (--seed makes that reproducible); pass

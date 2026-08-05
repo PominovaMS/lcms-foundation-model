@@ -71,7 +71,29 @@ data reusable.
 | --- | --- | --- |
 | `--seed` | `42` | Shuffle seed; part of the experiment, so record it if you change it. |
 | `--chunk-size` | `50000` | Spectra per write chunk. Bounds peak RAM during the shuffle; lower it if the build OOMs. |
-| `--force` | off | Rebuild an existing output. Without it, a complete build is a no-op. |
+| `--force` | off | Rebuild unconditionally. See the reuse rule below. |
+
+**Reuse — re-running a stage is cheap.** The build is skipped unless something that
+would change the data changed: the mzML file list in either split dir, the `--seed`,
+or the config's `max_num_peaks` (or a `.lance` dir has gone missing). A rebuild always
+says why:
+
+```
+Reusing .../lance — inputs unchanged (train=1,874,904  val=168,085 spectra, seed 42, ...)
+Rebuilding .../lance: train inputs changed (+12 / -0 files)
+Rebuilding .../lance: seed changed (42 -> 99)
+```
+
+So a hyperparameter sweep over one stage pays the ingest cost once, while changing
+`--accessions` or `--limit` rebuilds on its own. `run_sweep.slurm` regenerating the
+symlink farm does *not* trigger a rebuild — the names are stable.
+
+Comparison is by file **name**. Replacing a symlink target with different content
+under the same name goes unnoticed; use `--force` for that.
+
+> If a re-run is re-parsing mzML when you expected reuse, check that the output dir
+> isn't inside a directory something else deletes first — `run_sweep.slurm` keeps it
+> at `$SWEEP_ROOT/lance/$STAGE`, deliberately outside the `rm -rf`'d stage dir.
 
 **Disk:** staging and shuffled output coexist during the build, so it transiently
 needs ~2x the final size (~11 GB for 3.5M spectra, so budget ~22 GB). Staging is

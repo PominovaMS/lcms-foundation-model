@@ -6,12 +6,14 @@ the cross-file mixing that motivates the whole change can be asserted directly.
 """
 
 import json
+import shutil
 import sys
 from pathlib import Path
 
 import lance
 import polars as pl
 import pytest
+import yaml
 from depthcharge.data import SpectrumDataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
@@ -125,26 +127,66 @@ def _frame(n_files=3, per_file=100):
     )
 
 
+class _Stage:
+    """A stage dir with a stubbed ingest that records how often it actually ran.
+
+    Counting ingests is the whole point: the bug being fixed was a re-run silently
+    re-parsing every mzML, which a check on ``built_at`` alone would not have caught.
+    """
+
+    def __init__(self, path, calls, corrupt):
+        self.path = path
+        self.calls = calls
+        self.corrupt = corrupt
+
+    def files(self, split):
+        return sorted(p.name for p in (self.path / f"{split}_mzml").iterdir())
+
+    def add(self, split, name):
+        (self.path / f"{split}_mzml" / name).touch()
+
+    def remove(self, split, name):
+        (self.path / f"{split}_mzml" / name).unlink()
+
+
 @pytest.fixture
 def stage_dir(tmp_path, monkeypatch):
     """A stage dir plus a stubbed ingest, so main() runs without mzML parsing."""
     for split in ("train", "val"):
-        (tmp_path / f"{split}_mzml").mkdir()
+        d = tmp_path / f"{split}_mzml"
+        d.mkdir()
+        for name in ("a.mzML", "b.mzML", "c.mzML"):
+            (d / name).touch()
+
+    calls = []
+    corrupt = []
 
     def fake_build_dataset(data_dir, preprocessing_fn, batch_size, path=None):
+        calls.append(str(data_dir))
+        present = build_lance.mzml_in(Path(data_dir))
+        ingested = [f for f in present if f not in corrupt]
         per_file = 100 if "train" in str(data_dir) else 40  # -> 300 train, 120 val
         ds = SpectrumDataset(
-            _frame(n_files=3, per_file=per_file), batch_size=batch_size, path=path
+            _frame(n_files=max(len(ingested), 1), per_file=per_file),
+            batch_size=batch_size,
+            path=path,
         )
-        return ds, ["a.mzML", "b.mzML", "c.mzML"], []
+        return ds, ingested, [f for f in present if f in corrupt]
 
     monkeypatch.setattr(build_lance, "build_dataset", fake_build_dataset)
-    return tmp_path
+    return _Stage(tmp_path, calls, corrupt)
+
+
+def _argv(stage, out, **over):
+    argv = ["--data_dir", str(stage.path), "--out", str(out), "--seed", "7"]
+    for k, v in over.items():
+        argv += [f"--{k}", str(v)]
+    return argv
 
 
 def test_main_writes_both_splits_and_a_sidecar(stage_dir, tmp_path):
     out = tmp_path / "lance"
-    assert build_lance.main(["--data_dir", str(stage_dir), "--out", str(out), "--seed", "7"]) == 0
+    assert build_lance.main(_argv(stage_dir, out)) == 0
 
     assert (out / "train.lance").is_dir() and (out / "val.lance").is_dir()
     info = json.loads((out / "dataset_info.json").read_text())
@@ -155,17 +197,99 @@ def test_main_writes_both_splits_and_a_sidecar(stage_dir, tmp_path):
     assert info["preprocessing"]["max_num_peaks"] > 0
 
 
-def test_main_is_idempotent_and_force_rebuilds(stage_dir, tmp_path):
+# --- reuse rules --------------------------------------------------------------
+#
+# A sweep re-runs the same stage with different hyperparameters. Re-parsing the whole
+# corpus each time is what these guard against — and the counter is on ingests, not
+# timestamps, because that is the cost that actually hurt.
+
+
+def test_unchanged_inputs_are_not_re_ingested(stage_dir, tmp_path):
     out = tmp_path / "lance"
-    argv = ["--data_dir", str(stage_dir), "--out", str(out), "--seed", "7"]
-    build_lance.main(argv)
-    stamp = json.loads((out / "dataset_info.json").read_text())["built_at"]
+    build_lance.main(_argv(stage_dir, out))
+    assert len(stage_dir.calls) == 2  # train + val
 
-    build_lance.main(argv)  # no --force: should not rebuild
-    assert json.loads((out / "dataset_info.json").read_text())["built_at"] == stamp
+    assert build_lance.main(_argv(stage_dir, out)) == 0
+    assert len(stage_dir.calls) == 2, "re-ran ingest despite unchanged inputs"
 
-    build_lance.main([*argv, "--force"])
+
+def test_force_rebuilds_unchanged_inputs(stage_dir, tmp_path):
+    out = tmp_path / "lance"
+    build_lance.main(_argv(stage_dir, out))
+    build_lance.main([*_argv(stage_dir, out), "--force"])
+    assert len(stage_dir.calls) == 4
+
+
+@pytest.mark.parametrize("split", ["train", "val"])
+def test_added_file_rebuilds(stage_dir, tmp_path, split):
+    out = tmp_path / "lance"
+    build_lance.main(_argv(stage_dir, out))
+    stage_dir.add(split, "d.mzML")
+
+    build_lance.main(_argv(stage_dir, out))
+    assert len(stage_dir.calls) == 4
+    info = json.loads((out / "dataset_info.json").read_text())
+    assert "d.mzML" in info["splits"][split]["files"]
+
+
+def test_removed_file_rebuilds(stage_dir, tmp_path):
+    out = tmp_path / "lance"
+    build_lance.main(_argv(stage_dir, out))
+    stage_dir.remove("train", "c.mzML")
+
+    build_lance.main(_argv(stage_dir, out))
+    assert len(stage_dir.calls) == 4
+    info = json.loads((out / "dataset_info.json").read_text())
+    assert "c.mzML" not in info["splits"]["train"]["files"]
+
+
+def test_changed_seed_rebuilds(stage_dir, tmp_path):
+    """A different seed means a different stored order, so the data is not the same."""
+    out = tmp_path / "lance"
+    build_lance.main(_argv(stage_dir, out))
+    build_lance.main(["--data_dir", str(stage_dir.path), "--out", str(out), "--seed", "8"])
+    assert len(stage_dir.calls) == 4
+
+
+def test_changed_max_num_peaks_rebuilds(stage_dir, tmp_path):
+    """Preprocessing is baked in at ingest, so a new peak cap needs a new dataset."""
+    out = tmp_path / "lance"
+    build_lance.main(_argv(stage_dir, out))
+
+    cfg = yaml.safe_load(open(build_lance.ROOT / "config.yaml"))
+    cfg["data"]["max_num_peaks"] = cfg["data"]["max_num_peaks"] + 1
+    alt = tmp_path / "alt.yaml"
+    alt.write_text(yaml.safe_dump(cfg))
+
+    build_lance.main(_argv(stage_dir, out, config=alt))
+    assert len(stage_dir.calls) == 4
+
+
+def test_missing_lance_dir_rebuilds(stage_dir, tmp_path):
+    """The sidecar alone is not evidence the data is still there."""
+    out = tmp_path / "lance"
+    build_lance.main(_argv(stage_dir, out))
+    shutil.rmtree(out / "train.lance")
+
+    build_lance.main(_argv(stage_dir, out))
+    assert len(stage_dir.calls) == 4
     assert (out / "train.lance").is_dir()
+
+
+def test_unreadable_file_still_on_disk_is_not_a_change(stage_dir, tmp_path):
+    """Corrupt files are skipped at ingest but stay on disk.
+
+    Comparing only against the *ingested* list would see them as newly added and
+    rebuild on every single run — for any corpus containing one bad file.
+    """
+    stage_dir.corrupt.append("b.mzML")
+    out = tmp_path / "lance"
+    build_lance.main(_argv(stage_dir, out))
+    info = json.loads((out / "dataset_info.json").read_text())
+    assert info["splits"]["train"]["unreadable_files"] == ["b.mzML"]
+
+    build_lance.main(_argv(stage_dir, out))
+    assert len(stage_dir.calls) == 2, "an unreadable file forced a needless rebuild"
 
 
 def test_sidecar_is_written_last_so_a_partial_build_is_not_trusted(
@@ -177,7 +301,7 @@ def test_sidecar_is_written_last_so_a_partial_build_is_not_trusted(
     stale one surviving a crashed rebuild would be worse than no dataset at all.
     """
     out = tmp_path / "lance"
-    argv = ["--data_dir", str(stage_dir), "--out", str(out), "--seed", "7"]
+    argv = _argv(stage_dir, out)
     build_lance.main(argv)
     assert (out / "dataset_info.json").exists()
 

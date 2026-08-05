@@ -41,8 +41,18 @@ Usage
     # then
     cd source && python train.py --lance_dir <...>/stage03/lance --run_name stage03
 
-Writes ``<out>/{train.lance,val.lance,dataset_info.json}``. Idempotent: an existing
-complete output is left alone unless ``--force``.
+Writes ``<out>/{train.lance,val.lance,dataset_info.json}``.
+
+Reuse
+-----
+Re-running is cheap when nothing changed: the build is skipped unless the mzML file
+list, the ``--seed``, or the config's ``max_num_peaks`` differs from what
+``dataset_info.json`` records (or a ``.lance`` dir has gone missing). That is what
+makes a hyperparameter sweep over one stage pay the ingest cost once.
+
+The comparison is by file *name*, so replacing a symlink target with different
+content under the same name goes unnoticed — pass ``--force`` for that, or any time
+you want an unconditional rebuild.
 """
 
 import argparse
@@ -103,7 +113,8 @@ def parse_args(argv=None):
     p.add_argument(
         "--force",
         action="store_true",
-        help="Rebuild even if the output already looks complete",
+        help="Rebuild unconditionally. Without it the build is skipped when the mzML "
+        "file list, seed and max_num_peaks all match what dataset_info.json records.",
     )
     return p.parse_args(argv)
 
@@ -161,15 +172,59 @@ def shuffle_into(staging, out_path: Path, seed: int, chunk_size: int) -> int:
     return n
 
 
+def mzml_in(split_dir: Path) -> list[str]:
+    """The mzML filenames in a split dir, matching what build_dataset would ingest."""
+    return sorted(
+        f
+        for f in os.listdir(split_dir)
+        if f.lower().endswith((".mzml", ".mzml.gz"))
+    )
+
+
+def staleness_reason(info, data_dir: Path, out_dir: Path, seed: int, max_num_peaks: int):
+    """Why an existing build can't be reused, or None if it can.
+
+    Existence alone is not enough. A stage dir is a regenerable symlink farm, so its
+    contents change whenever `--accessions` or `--limit` change — and silently
+    training on a stale corpus is far worse than paying to re-ingest. Checking the
+    recorded inputs against what is on disk now is what lets the common case (same
+    data, different hyperparameters) skip ingestion safely.
+
+    Note this compares file *names*. Replacing a symlink target with different
+    content under the same name is invisible here; use ``--force`` for that.
+    """
+    if info.get("seed") != seed:
+        return f"seed changed ({info.get('seed')} -> {seed})"
+
+    built_peaks = info.get("preprocessing", {}).get("max_num_peaks")
+    if built_peaks != max_num_peaks:
+        return f"max_num_peaks changed ({built_peaks} -> {max_num_peaks})"
+
+    for split in SPLITS:
+        if not (out_dir / f"{split}.lance").is_dir():
+            return f"{split}.lance is missing"
+
+        recorded = info.get("splits", {}).get(split)
+        if recorded is None:
+            return f"sidecar has no record of the {split} split"
+        # Corrupt files were skipped at ingest but are still on disk, so the union is
+        # what was actually present last time. Comparing against `files` alone would
+        # make any corpus with an unreadable file rebuild on every single run.
+        before = sorted(recorded.get("files", []) + recorded.get("unreadable_files", []))
+        now = mzml_in(data_dir / f"{split}_mzml")
+        if before != now:
+            added = len(set(now) - set(before))
+            removed = len(set(before) - set(now))
+            return f"{split} inputs changed (+{added} / -{removed} files)"
+
+    return None
+
+
 def main(argv=None):
     args = parse_args(argv)
     data_dir = Path(args.data_dir)
     out_dir = Path(args.out) if args.out else data_dir / "lance"
     info_path = out_dir / "dataset_info.json"
-
-    if info_path.exists() and not args.force:
-        print(f"{info_path} exists — nothing to do (use --force to rebuild).")
-        return 0
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
@@ -179,6 +234,22 @@ def main(argv=None):
     for split in SPLITS:
         if not (data_dir / f"{split}_mzml").is_dir():
             raise SystemExit(f"Missing {data_dir / f'{split}_mzml'}")
+
+    if info_path.exists() and not args.force:
+        with open(info_path) as f:
+            existing = json.load(f)
+        reason = staleness_reason(existing, data_dir, out_dir, args.seed, max_num_peaks)
+        if reason is None:
+            counts = "  ".join(
+                f"{s}={existing['splits'][s]['n_spectra']:,}" for s in SPLITS
+            )
+            print(
+                f"Reusing {out_dir} — inputs unchanged ({counts} spectra, "
+                f"seed {args.seed}, built {existing.get('built_at')}). "
+                f"Pass --force to rebuild."
+            )
+            return 0
+        print(f"Rebuilding {out_dir}: {reason}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     # A stale info file must not survive a failed rebuild — a later run would then
