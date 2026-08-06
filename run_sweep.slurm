@@ -2,8 +2,22 @@
 # Per stage: build the training set, pretrain, then probe on abele.
 # Build one mixed training set from ALL accessions, pretrain, then probe on abele.
 #   Single mixed run:  sbatch run_sweep.slurm
+#
+# Re-running the SAME data with different hyperparameters (e.g. another LR): change
+# LR and RUN_TAG below and resubmit. Step 2 reuses the existing Lance dataset, so the
+# runs train on byte-identical data.
+#   BUT WAIT for any in-flight job on the same DATA_TAG to finish step 2 (it prints
+#   "Wrote .../lance/stageNN_<DATA_TAG>") before submitting. Earlier than that, this
+#   job's `rm -rf "$STAGE_DIR"` deletes the dir that job is still ingesting from, and
+#   both would write the same Lance dataset at once. Editing this file mid-run is safe —
+#   Slurm spools the script at submit time.
+#
+# Training on a DIFFERENT input set (e.g. 5xnolim instead of lim5x50): change
+# ACCESSIONS/LIMIT, then change DATA_TAG to match. That routes the stage dir and the
+# Lance dataset to their own paths, so the new set is built and saved alongside the old
+# one rather than over it — and neither job has to wait on the other.
 
-#SBATCH --partition=one_day
+#SBATCH --partition=seven_days
 #SBATCH --job-name=pride_sweep
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
@@ -29,7 +43,18 @@ ABELE_META=/mnt/data/shared/lc_ms_foundation/abele_data/all_abele_metadata.csv
 # Datasets to mix into a single training set
 ACCESSIONS=(PXD004452 PXD012636 PXD009737 PXD030983 PXD013868)
 MAX_EPOCHS=50     # smoke test; raise for the real run
-LIMIT=25         # smoke test: files per accession. Set empty ("") to use all.
+LIMIT=          # files per accession. Empty ("") = use all.
+
+# Names the DATA (accessions + LIMIT), and nothing else. It goes into the stage dir and
+# the Lance dir, so each data variant gets its own paths and they coexist instead of
+# overwriting each other:
+#   lim5x50   -> 5 accessions, LIMIT=50
+#   5xnolim   -> 5 accessions, no limit
+# CHANGE THIS WHENEVER YOU CHANGE ACCESSIONS OR LIMIT. If you don't, the new data
+# lands on the old dataset's path and step 2 rebuilds over it — the previous dataset
+# is gone. Hyperparameters do NOT belong here; they go in RUN_TAG. Keep it echoed in
+# RUN_TAG too, so the run name says which data the checkpoint was trained on.
+DATA_TAG=5xnolim
 PROBE_ALL=      # empty = probe 15 mid-sized genera. Set to 1 to probe ALL genera (slower).
 
 # --- probe split + probe reproducibility -----------------------------------
@@ -51,7 +76,7 @@ PROBE_REPEATS=3           # accuracy is the mean over this many seeded probe fit
 # Bigger + more heterogeneous training sets tolerate (and usually want) a higher
 # peak LR, but need a longer warmup so the early, high-variance batches from five
 # different labs don't spike the loss before the schedule has ramped.
-LR=5e-4
+LR=1e-4
 WARMUP_ITERS=6000
 SHUFFLE_SEED=42   # seeds the on-disk shuffle of the training data (step 2).
                   # Fixed across a sweep so every stage differs only in its data.
@@ -59,20 +84,32 @@ TRAIN_SEED=42     # seeds training itself (step 3): the per-epoch batch shuffle,
                   # peak masking, and model init. Also fixed across a sweep, for the
                   # same reason — vary it only to measure run-to-run variance.
 
-RUN_TAG=lim5x25_ep50_lr5e-4        # optional label to separate runs of the SAME stage (e.g. "lim25_ep50").
+RUN_TAG=shuffled_5xnolim_ep25_lr1e-4        # optional label to separate runs of the SAME stage (e.g. "lim25_ep50").
                 # Keeps checkpoints, logs, and results from colliding/overwriting.
-                # Include the LR here whenever you change it, or runs overwrite each other.
+                # Include the LR here whenever you change it, or runs overwrite each other —
+                # nothing else in the pipeline records it, so this string is the only
+                # thing distinguishing two runs over the same data at different LRs.
 
-# Stage = array index, or 1 for a bare submit. RUN adds the optional tag so distinct
-# configs (e.g. a data-volume ramp on one accession) don't overwrite each other.
+# Stage = array index, or 1 for a bare submit. DATA_ID names everything that depends on
+# the DATA, so a new input set (5xnolim vs lim5x50) builds a SEPARATE stage dir and
+# Lance dataset instead of overwriting the previous one — both stay on disk and are
+# reusable. RUN adds RUN_TAG on top so distinct configs (e.g. another LR over that same
+# data) don't overwrite each other's checkpoints, logs and results.
 STAGE_NUM="${SLURM_ARRAY_TASK_ID:-1}"
 STAGE=$(printf "stage%02d" "$STAGE_NUM")
-STAGE_DIR="$SWEEP_ROOT/$STAGE"
+DATA_ID="$STAGE${DATA_TAG:+_$DATA_TAG}"
+STAGE_DIR="$SWEEP_ROOT/$DATA_ID"
 # Deliberately OUTSIDE STAGE_DIR: step 1 does `rm -rf "$STAGE_DIR"`, which would
 # otherwise delete the prebuilt dataset before it could ever be reused.
-LANCE_DIR="$SWEEP_ROOT/lance/$STAGE"
+LANCE_DIR="$SWEEP_ROOT/lance/$DATA_ID"
 RUN="$STAGE${RUN_TAG:+_$RUN_TAG}"
 CKPT="$REPO/source/train_checkpoints/foundation_model/lightning_logs/$RUN/checkpoints/last.ckpt"
+
+# Echo the resolved paths up front: step 2 is silent when it reuses an existing
+# dataset, so this is what tells you which data this run trained on.
+echo "run        : $RUN"
+echo "stage dir  : $STAGE_DIR"
+echo "lance dir  : $LANCE_DIR"
 
 # 1) Build the mixed training set from ALL accessions (one combined train/val set).
 #    Clear first so the dir (a regenerable symlink farm — cheap) reflects the current
