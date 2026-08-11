@@ -245,7 +245,7 @@ class MS1Encoder(L.LightningModule):
         masked_peak_embs = peak_embs[masks]
         # predict masked peaks binned mz & I
         pred_mz_bins = self.head_mz(masked_peak_embs)
-        pred_I = self.head_I(masked_peak_embs).squeeze(dim=-1)
+        # pred_I = self.head_I(masked_peak_embs).squeeze(dim=-1)
 
         loss_mz_bin = self.loss_mz_bin(pred_mz_bins, target_mz_bins)
         # loss_I = self.loss_I(pred_I, target_I)
@@ -278,10 +278,13 @@ class MS1Encoder(L.LightningModule):
             target_mz_bins[:n].cpu().numpy(),
             target_I[:n].cpu().numpy(),
         )
-        mz_bins_pred, I_pred = (
-            pred_mz_bins[:n].argmax(dim=1).cpu().numpy(),
-            pred_I[:n].cpu().numpy(),
-        )
+        # `argmax` returns int64 indices, so this survives mixed precision even though
+        # head_mz's logits are bf16 under autocast. `pred_I` is deliberately NOT
+        # converted: numpy has no bfloat16 dtype, so `pred_I.numpy()` raises
+        # "Got unsupported ScalarType BFloat16" under precision="bf16-mixed" — and its
+        # only consumer (`I_pred.ravel()` below) is disabled along with the intensity
+        # head. Re-enabling that column needs `pred_I[:n].float().cpu().numpy()`.
+        mz_bins_pred = pred_mz_bins[:n].argmax(dim=1).cpu().numpy()
         sample_df = np.column_stack(
             (
                 mz_bins_true.ravel(),
