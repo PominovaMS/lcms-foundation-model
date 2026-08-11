@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import yaml
 import pytorch_lightning as L
@@ -119,6 +120,8 @@ WARMUP_ITERS = (
 
 # Extract configuration values
 BATCH_SIZE = config.data.batch_size
+ACCUMULATE_GRAD_BATCHES = config.training.accumulate_grad_batches
+PRECISION = config.training.precision
 CHECKPOINT_PATH = config.training.checkpoint_path
 RUN_NAME = args.run_name or config.name
 # --max_steps takes precedence: cap by steps and leave epochs unlimited (-1) so the
@@ -230,12 +233,19 @@ if args.no_shuffle:
     # NOT ceil(n_spectra / BATCH_SIZE): Lance batches never span fragments, so each
     # mzML file / write chunk adds a partial batch. That formula undercounted by up
     # to ~27% on many-file sets, which is what made OneCycleLR raise mid-run.
-    steps_per_epoch = iterable_steps_per_epoch(train_dataset, BATCH_SIZE)
+    batches_per_epoch = iterable_steps_per_epoch(train_dataset, BATCH_SIZE)
     derivation = "exact (per-fragment sum)"
 else:
-    # Map-style loader: len() is the true steps/epoch.
-    steps_per_epoch = len(train_loader)
+    # Map-style loader: len() is the true batches/epoch.
+    batches_per_epoch = len(train_loader)
     derivation = "exact (len(train_loader))"
+
+# OneCycleLR is stepped per OPTIMIZER step, not per batch, so gradient accumulation
+# shortens the schedule. Lightning still steps on an epoch's trailing partial
+# accumulation window, hence ceil — and ceil is also the safe rounding: overshooting
+# only leaves the anneal slightly unfinished, while undershooting makes OneCycleLR
+# raise mid-run.
+steps_per_epoch = math.ceil(batches_per_epoch / ACCUMULATE_GRAD_BATCHES)
 
 if MAX_STEPS != -1:
     total_steps = MAX_STEPS
@@ -253,6 +263,12 @@ if not auto_total_steps:
 print(
     f"steps/epoch={steps_per_epoch}  total_steps={total_steps}  "
     f"schedule_total_steps={total_steps_sched} ({derivation})"
+)
+print(
+    f"precision={PRECISION}  batch_size={BATCH_SIZE}  "
+    f"accumulate_grad_batches={ACCUMULATE_GRAD_BATCHES}  "
+    f"effective_batch={BATCH_SIZE * ACCUMULATE_GRAD_BATCHES}  "
+    f"batches/epoch={batches_per_epoch}"
 )
 print(
     f"lr={LR}{' (CLI)' if args.lr is not None else ' (config)'}  "
@@ -309,6 +325,8 @@ trainer = L.Trainer(
     callbacks=[checkpoint_callback],
     accelerator=config.training.accelerator,
     devices=config.training.devices,
+    precision=PRECISION,
+    accumulate_grad_batches=ACCUMULATE_GRAD_BATCHES,
     max_epochs=MAX_EPOCHS,
     max_steps=MAX_STEPS,
     gradient_clip_val=config.training.gradient_clip_val,

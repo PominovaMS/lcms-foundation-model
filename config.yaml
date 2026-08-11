@@ -7,15 +7,17 @@ name: "ms1-mz-200_peaks-sqrt-clf_run_retrain" # ms1 # retrain finetuning
 data:
   train_dir: "train_mzml"
   val_dir: "val_mzml"
-  batch_size: 1024   # 2000 OOMs the 44GB L40S (fp32); lower this further if still tight
+  batch_size: 1024   # 2000 OOMs the 44GB L40S (fp32); with bf16-mixed there is headroom
+                     # again, but raise training.accumulate_grad_batches rather than this
+                     # if you need memory back without changing the effective batch.
   max_num_peaks: 200
 
 # Model configuration
 model:
-  d_model: 256
+  d_model: 512 #Previously 256
   nhead: 8
-  dim_feedforward: 512
-  n_layers: 6
+  dim_feedforward: 1024 #Previously 512
+  n_layers: 9 #Previously 6
   dropout: 0.1
   n_bins: 1200
   bin_mz_min: 300
@@ -45,3 +47,13 @@ training:
   gradient_clip_val: 5
   accelerator: "gpu"
   devices: 1
+  # Activations are (batch, n_peaks, d_model) and dominate memory, so they scale
+  # linearly with d_model: at batch 1024 / 200 peaks, d_model 512 needs ~44GB in fp32
+  # and OOMs the L40S. bf16-mixed roughly halves that and is ~1.5-2x faster. Weights,
+  # Adam state, the m/z sinusoidal encoding and the cross-entropy all stay fp32.
+  # Record the precision in the run name — nothing else in the pipeline does, so an
+  # fp32 and a bf16 run of the same data are otherwise indistinguishable in results.csv.
+  precision: "bf16-mixed"
+  # Effective batch = data.batch_size * this. Raise it (and halve batch_size) to cut
+  # activation memory without touching the effective batch or the LR schedule.
+  accumulate_grad_batches: 1

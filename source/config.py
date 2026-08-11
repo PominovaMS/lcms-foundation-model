@@ -41,6 +41,17 @@ class TrainingConfig:
     gradient_clip_val: float
     accelerator: str
     devices: int
+    # Lightning precision. Activations dominate memory here — they are
+    # (batch, n_peaks, d_model)-shaped, so they scale linearly with d_model — and
+    # "bf16-mixed" roughly halves them while being ~1.5-2x faster on the L40S.
+    # Weights, Adam moments and the optimizer step stay fp32; so does the m/z
+    # sinusoidal encoding and the cross-entropy (see the precision note in CLAUDE.md).
+    # "32-true" restores the old behaviour.
+    precision: str = "32-true"
+    # An optimizer step sees accumulate_grad_batches * batch_size spectra. Halving
+    # batch_size and doubling this keeps the effective batch — and therefore the LR
+    # schedule — unchanged while halving activation memory, at no cost in precision.
+    accumulate_grad_batches: int = 1
 
 
 @dataclass

@@ -210,6 +210,8 @@ def main():
         callbacks=callbacks,
         accelerator=config.training.accelerator,
         devices=config.training.devices,
+        precision=config.training.precision,
+        accumulate_grad_batches=config.training.accumulate_grad_batches,
         max_epochs=args.ssl_max_epochs,
         gradient_clip_val=config.training.gradient_clip_val,
         num_sanity_val_steps=2,
