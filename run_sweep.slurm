@@ -19,8 +19,15 @@
 
 #SBATCH --partition=one_day
 #SBATCH --job-name=pride_sweep
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=16
+# asimov has 4 L40S (Gres=gpu:l40s:4). --ntasks-per-node MUST equal the GPU count and
+# the training command MUST be launched with `srun` (step 3 below) — sbatch alone sets
+# SLURM_NTASKS, which makes Lightning treat the job as externally launched and skip
+# spawning the other ranks, while still building a DistributedSampler for all of them.
+# The result is one process training on 1/N of the data, at no speedup and with no
+# error. --cpus-per-task is PER TASK, so 8 x 2 keeps the previous 16 total.
+#SBATCH --gres=gpu:2
+#SBATCH --ntasks-per-node=2
+#SBATCH --cpus-per-task=8
 #SBATCH --nodelist=asimov
 #SBATCH --output=/mnt/data/cadams/slurm_output/stdout.%A_%a
 #SBATCH --error=/mnt/data/cadams/slurm_output/stderr.%A_%a
@@ -78,17 +85,27 @@ PROBE_REPEATS=3           # accuracy is the mean over this many seeded probe fit
 # different labs don't spike the loss before the schedule has ramped.
 LR=2e-4
 WARMUP_ITERS=6000
+
+# GPUs for DDP. Must match --gres and --ntasks-per-node above. config.yaml's
+# data.batch_size is PER GPU, so this multiplies the effective batch — at batch_size
+# 512 and DEVICES 2 the effective batch is 1024, which is what the LR schedule above
+# was tuned at. Change one without the other and the schedule no longer applies.
+DEVICES=2
 SHUFFLE_SEED=42   # seeds the on-disk shuffle of the training data (step 2).
                   # Fixed across a sweep so every stage differs only in its data.
 TRAIN_SEED=42     # seeds training itself (step 3): the per-epoch batch shuffle, the
                   # peak masking, and model init. Also fixed across a sweep, for the
                   # same reason — vary it only to measure run-to-run variance.
 
-RUN_TAG=shuffled_lim5x50_ep25_lr2e-4        # optional label to separate runs of the SAME stage (e.g. "lim25_ep50").
+RUN_TAG=shuffled_lim5x50_ep25_lr2e-4_d512L9ff2048_bs512x2gpu_bf16
+                # optional label to separate runs of the SAME stage (e.g. "lim25_ep50").
                 # Keeps checkpoints, logs, and results from colliding/overwriting.
                 # Include the LR here whenever you change it, or runs overwrite each other —
                 # nothing else in the pipeline records it, so this string is the only
                 # thing distinguishing two runs over the same data at different LRs.
+                # Same goes for model geometry, batch/device split and precision: none of
+                # them reach the run name or the results CSV on their own, so a d512/ff1024
+                # fp32 run and a d512/ff2048 bf16 run are otherwise indistinguishable rows.
 
 # Stage = array index, or 1 for a bare submit. DATA_ID names everything that depends on
 # the DATA, so a new input set (5xnolim vs lim5x50) builds a SEPARATE stage dir and
@@ -137,11 +154,15 @@ rm -rf "$STAGE_DIR"
     --seed "$SHUFFLE_SEED"
 
 # 3) Pretrain (train.py runs from source/, so checkpoints land under source/).
-#    Batches are re-drawn every epoch (--seed makes that reproducible); pass
-#    --no_shuffle to reproduce a pre-shuffle run.
-( cd source && "$ENV/bin/python" train.py \
+#    Batches are re-drawn every epoch (--seed makes that reproducible); --no_shuffle
+#    reproduces a pre-shuffle run, but is single-GPU only (train.py rejects it under
+#    DDP: Lance shards IterableDatasets by fragment, which hangs at the epoch boundary).
+#    `srun` is required whenever DEVICES > 1 — see the header. Steps 1, 2 and 4 stay
+#    un-srun'd so they run once rather than once per task.
+( cd source && srun "$ENV/bin/python" train.py \
     --lance_dir "$LANCE_DIR" --config ../config.yaml \
     --run_name "$RUN" --max_epochs "$MAX_EPOCHS" --seed "$TRAIN_SEED" \
+    ${DEVICES:+--devices "$DEVICES"} \
     ${LR:+--lr "$LR"} ${WARMUP_ITERS:+--warmup_iters "$WARMUP_ITERS"} )
 
 # 4) Probe the checkpoint on abele -> one row in results/<run>.csv.

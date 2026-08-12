@@ -7,7 +7,10 @@ name: "ms1-mz-200_peaks-sqrt-clf_run_retrain" # ms1 # retrain finetuning
 data:
   train_dir: "train_mzml"
   val_dir: "val_mzml"
-  batch_size: 1024   # 2000 OOMs the 44GB L40S (fp32); with bf16-mixed there is headroom
+  batch_size: 512    # PER GPU under DDP: 512 x 2 devices = effective batch 1024, the
+                     # value the LR schedule was tuned at. Halved from 1024 when
+                     # dim_feedforward went to 2048 — see the memory note under training.
+                     # 2000 OOMs the 44GB L40S (fp32); with bf16-mixed there is headroom
                      # again, but raise training.accumulate_grad_batches rather than this
                      # if you need memory back without changing the effective batch.
   max_num_peaks: 200
@@ -16,7 +19,7 @@ data:
 model:
   d_model: 512 #Previously 256
   nhead: 8
-  dim_feedforward: 1024 #Previously 512
+  dim_feedforward: 2048 #Previously 1024 (2x d_model); 4x is the conventional ratio
   n_layers: 9 #Previously 6
   dropout: 0.1
   n_bins: 1200
@@ -46,11 +49,19 @@ training:
   max_epochs: 1000 # 200
   gradient_clip_val: 5
   accelerator: "gpu"
+  # Used by eval/retrain_eval.py and eval/online_eval.py, which must stay single-GPU
+  # (their probe callbacks iterate loaders by hand, so DDP would never shard them and
+  # each rank would train a divergent probe). train.py takes --devices instead; asimov
+  # has 4 L40S. Multi-GPU also needs `srun` + --ntasks-per-node in the slurm script —
+  # without them Lightning silently runs ONE process while still sharding the sampler.
   devices: 1
-  # Activations are (batch, n_peaks, d_model) and dominate memory, so they scale
-  # linearly with d_model: at batch 1024 / 200 peaks, d_model 512 needs ~44GB in fp32
-  # and OOMs the L40S. bf16-mixed roughly halves that and is ~1.5-2x faster. Weights,
-  # Adam state, the m/z sinusoidal encoding and the cross-entropy all stay fp32.
+  # Saved-for-backward activations are roughly
+  #   n_layers * batch * (max_num_peaks+1) * d_model * 2B * (10 + 2.5*dim_feedforward/d_model)
+  # so they scale linearly with d_model, dim_feedforward and batch. At batch 1024 /
+  # 200 peaks, d_model 512 / ff 1024 needs ~28GB in bf16 and ~56GB in fp32, which is
+  # what OOM'd the 44GB L40S. bf16-mixed roughly halves it and is ~1.5-2x faster.
+  # Weights, Adam state, the m/z sinusoidal encoding and the cross-entropy stay fp32.
+  # ff 1024->2048 takes that to ~37GB at batch 1024, hence batch 512 above.
   # Record the precision in the run name — nothing else in the pipeline does, so an
   # fp32 and a bf16 run of the same data are otherwise indistinguishable in results.csv.
   precision: "bf16-mixed"
