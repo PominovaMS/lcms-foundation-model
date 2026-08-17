@@ -84,7 +84,7 @@ PROBE_REPEATS=3           # accuracy is the mean over this many seeded probe fit
 # Bigger + more heterogeneous training sets tolerate (and usually want) a higher
 # peak LR, but need a longer warmup so the early, high-variance batches from five
 # different labs don't spike the loss before the schedule has ramped.
-LR=2e-4
+LR=5e-5
 WARMUP_ITERS=6000
 
 SHUFFLE_SEED=42   # seeds the on-disk shuffle of the training data (step 2).
@@ -93,7 +93,7 @@ TRAIN_SEED=42     # seeds training itself (step 3): the per-epoch batch shuffle,
                   # peak masking, and model init. Also fixed across a sweep, for the
                   # same reason — vary it only to measure run-to-run variance.
 
-RUN_TAG=shuffled_lim5x50_ep25_lr2e-4_d512L9ff2048_bs512xacc2_bf16
+RUN_TAG=l9d1024ff2048_bs64_lim5x100_ep50_lr5e-5
                 # optional label to separate runs of the SAME stage (e.g. "lim25_ep50").
                 # Keeps checkpoints, logs, and results from colliding/overwriting.
                 # Include the LR here whenever you change it, or runs overwrite each other —

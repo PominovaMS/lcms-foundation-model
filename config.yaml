@@ -7,18 +7,12 @@ name: "ms1-mz-200_peaks-sqrt-clf_run_retrain" # ms1 # retrain finetuning
 data:
   train_dir: "train_mzml"
   val_dir: "val_mzml"
-  batch_size: 512    # Halved from 1024 when dim_feedforward went to 2048 — see the
-                     # memory note under training. training.accumulate_grad_batches is
-                     # 2 to compensate, so the effective batch stays 1024, the value the
-                     # LR schedule was tuned at. 2000 OOMs the 44GB L40S (fp32); with
-                     # bf16-mixed there is headroom again, but raise
-                     # training.accumulate_grad_batches rather than this if you need
-                     # memory back without changing the effective batch.
+  batch_size: 64 #Previously 1024
   max_num_peaks: 200
 
 # Model configuration
 model:
-  d_model: 512 #Previously 256
+  d_model: 1024 #Previously 256
   nhead: 8
   dim_feedforward: 2048 #Previously 1024 (2x d_model); 4x is the conventional ratio
   n_layers: 9 #Previously 6
@@ -59,13 +53,14 @@ training:
   # 200 peaks, d_model 512 / ff 1024 needs ~28GB in bf16 and ~56GB in fp32, which is
   # what OOM'd the 44GB L40S. bf16-mixed roughly halves it and is ~1.5-2x faster.
   # Weights, Adam state, the m/z sinusoidal encoding and the cross-entropy stay fp32.
-  # ff 1024->2048 takes that to ~37GB at batch 1024, hence batch 512 above with
-  # accumulate_grad_batches 2 to keep the effective batch at 1024.
+  # ff 1024->2048 takes that to ~37GB at batch 1024 in bf16, so ~76GB in fp32 — which
+  # is why "32-true" here forces batch_size down to 256 with accumulate_grad_batches 4
+  # rather than 1024 x 1. Same effective batch, ~4x the steps' worth of forward passes.
   # Record the precision in the run name — nothing else in the pipeline does, so an
   # fp32 and a bf16 run of the same data are otherwise indistinguishable in results.csv.
-  precision: "bf16-mixed"
+  precision: "32-true"
   # Effective batch = data.batch_size * this. Raise it (and halve batch_size) to cut
-  # activation memory without touching the effective batch or the LR schedule.
-  # 512 x 2 = 1024, the effective batch the LR schedule was tuned at; one optimizer
-  # step still consumes 1024 spectra, so warmup_iters keeps its meaning.
-  accumulate_grad_batches: 2
+  # activation memory without touching the effective batch or the LR schedule — one
+  # optimizer step still consumes the same number of spectra, so warmup_iters and
+  # total_steps keep their meaning either way.
+  accumulate_grad_batches: 4
