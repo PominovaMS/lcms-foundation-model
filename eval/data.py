@@ -1,5 +1,6 @@
 """Shared data loading, splitting, and DataLoader creation for eval experiments."""
 
+import json
 import logging
 import os
 
@@ -265,11 +266,59 @@ def assign_splits(
     return meta_df
 
 
-def load_mzml_data(data_dir: str, peak_files: list[str], max_num_peaks: int) -> dict:
+def _open_mzml_cache(cache_dir: str, data_dir: str, max_num_peaks: int) -> None:
+    """Create ``cache_dir`` if needed and validate its ``cache_info.json``.
+
+    Parsing bakes the preprocessing in, and cache entries are keyed by mzML
+    basename, so a cache dir is only valid for ONE (data_dir, max_num_peaks)
+    pair. Reusing it across either would serve spectra that look fine and are
+    not what the config asked for — hence a hard refusal rather than a warning.
+    Mirrors the ``dataset_info.json`` check ``train.py --lance_dir`` makes.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    info_path = os.path.join(cache_dir, "cache_info.json")
+    info = {
+        "data_dir": os.path.realpath(data_dir),
+        "max_num_peaks": max_num_peaks,
+        "intensity_scaling": "root",
+        "ms_level": 1,
+    }
+
+    if not os.path.exists(info_path):
+        with open(info_path, "w") as f:
+            json.dump(info, f, indent=2)
+        return
+
+    with open(info_path) as f:
+        recorded = json.load(f)
+
+    for key in ("data_dir", "max_num_peaks", "intensity_scaling", "ms_level"):
+        if recorded.get(key) != info[key]:
+            raise SystemExit(
+                f"mzML cache {cache_dir} was built with {key}="
+                f"{recorded.get(key)!r}, but this run wants {info[key]!r}. "
+                f"Use a separate cache dir for it (one dir per dataset / peak "
+                f"cap), or delete {cache_dir} to rebuild."
+            )
+
+
+def load_mzml_data(
+    data_dir: str,
+    peak_files: list[str],
+    max_num_peaks: int,
+    cache_dir: str | None = None,
+) -> dict:
     """
     Load mzML files from data_dir via depthcharge.
     Returns dict mapping filename → polars DataFrame of MS1 spectra.
     Logs any files listed in peak_files but missing from data_dir.
+
+    With ``cache_dir`` set, each parsed file is persisted as
+    ``<cache_dir>/<peak_file>.parquet`` and reloaded from there next time —
+    the XML parse dominates the runtime of an eval, and its output depends only
+    on (file, max_num_peaks, the preprocessing below). The cache is per file, so
+    changing the split settings reuses everything already parsed and only reads
+    the newly-included files.
     """
     existing = []
     missing = []
@@ -286,6 +335,9 @@ def load_mzml_data(data_dir: str, peak_files: list[str], max_num_peaks: int) -> 
         for f in missing:
             logger.warning(f"  missing: {f}")
 
+    if cache_dir:
+        _open_mzml_cache(cache_dir, data_dir, max_num_peaks)
+        logger.info(f"mzML cache: {cache_dir}")
     logger.info(f"Loading {len(existing)}/{len(peak_files)} mzML files...")
 
     preprocessing_fn = [
@@ -293,8 +345,19 @@ def load_mzml_data(data_dir: str, peak_files: list[str], max_num_peaks: int) -> 
         preprocessing.scale_intensity(scaling="root", max_intensity=1.0),
     ]
     dfs = {}
+    n_cached = 0
     for peak_file in existing:
-        dfs[peak_file] = spectra_to_df(
+        cache_path = (
+            os.path.join(cache_dir, os.path.basename(peak_file) + ".parquet")
+            if cache_dir
+            else None
+        )
+        if cache_path and os.path.exists(cache_path):
+            dfs[peak_file] = pl.read_parquet(cache_path)
+            n_cached += 1
+            continue
+
+        df = spectra_to_df(
             os.path.join(data_dir, peak_file),
             metadata_df=None,
             ms_level=1,
@@ -302,6 +365,22 @@ def load_mzml_data(data_dir: str, peak_files: list[str], max_num_peaks: int) -> 
             valid_charge=None,
             custom_fields=None,
             progress=True,
+        )
+        dfs[peak_file] = df
+
+        if cache_path:
+            # Write-then-rename: a killed job must not leave a truncated parquet
+            # that a later run reads as valid, and an --array submit has several
+            # tasks writing the same entries at once (identical bytes, so the
+            # last rename winning is fine — but a shared tmp path is not).
+            tmp_path = f"{cache_path}.{os.getpid()}.tmp"
+            df.write_parquet(tmp_path)
+            os.replace(tmp_path, cache_path)
+
+    if cache_dir:
+        logger.info(
+            f"Loaded {len(dfs)} files — {n_cached} from cache, "
+            f"{len(dfs) - n_cached} parsed"
         )
     return dfs
 

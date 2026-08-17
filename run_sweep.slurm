@@ -40,6 +40,14 @@ SWEEP_ROOT=/mnt/data/shared/lc_ms_foundation/training_sets/sweep
 ABELE_MZML=/mnt/data/shared/lc_ms_foundation/abele_data/mzml
 ABELE_META=/mnt/data/shared/lc_ms_foundation/abele_data/all_abele_metadata.csv
 
+# Cache of the parsed abele spectra for step 4 (one parquet per mzML), so each sweep run
+# reloads them instead of re-parsing all ~260 files after pretraining. Shared with
+# run_probe.slurm — same mzML, same max_num_peaks, so the two fill one cache for each
+# other. `-` not `:-`: an explicitly empty export must mean "no cache". A cache dir is
+# tied to one ABELE_MZML at one max_num_peaks and the run aborts if either disagrees, so
+# change the two together.
+MZML_CACHE="${MZML_CACHE-/mnt/data/cadams/cache/abele_mzml}"
+
 # Datasets to mix into a single training set
 ACCESSIONS=(PXD004452 PXD012636 PXD009737 PXD030983 PXD013868)
 MAX_EPOCHS=25     # smoke test; raise for the real run
@@ -115,6 +123,7 @@ CKPT="$REPO/source/train_checkpoints/foundation_model/lightning_logs/$RUN/checkp
 echo "run        : $RUN"
 echo "stage dir  : $STAGE_DIR"
 echo "lance dir  : $LANCE_DIR"
+echo "mzml cache : ${MZML_CACHE:-(disabled — re-parsing abele mzML)}"
 
 # 1) Build the mixed training set from ALL accessions (one combined train/val set).
 #    Clear first so the dir (a regenerable symlink farm — cheap) reflects the current
@@ -164,6 +173,7 @@ mkdir -p "$REPO/results"
     --max_files_per_genus "$MAX_FILES_PER_GENUS" \
     --probe_seed "$PROBE_SEED" --probe_repeats "$PROBE_REPEATS" \
     --results_csv "$REPO/results/$RUN.csv" \
+    ${MZML_CACHE:+--mzml_cache_dir "$MZML_CACHE"} \
     ${PROBE_ALL:+--probe_all}
 
 # 21 columns on one line is unreadable in a slurm log; tabulate if `column` exists.

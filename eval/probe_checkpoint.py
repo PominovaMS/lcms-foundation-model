@@ -95,6 +95,9 @@ def append_result(results_csv: str, row: dict) -> None:
         # settings that must match for two rows to be comparable
         "probe_seed",
         "probe_repeats",
+        "probe_lr",
+        "probe_n_epochs",
+        "probe_min_train_loss",
         "n_probe_genera",
         "n_ssl_top",
         "probe_all",
@@ -123,6 +126,16 @@ def main():
     )
     parser.add_argument("--meta_path", required=True, help="Path to metadata CSV")
     parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
+    parser.add_argument(
+        "--mzml_cache_dir",
+        default=None,
+        help="Persist the parsed spectra here (one parquet per mzML) and reload "
+        "them on later runs instead of re-parsing — the mzML parse dominates the "
+        "runtime of a probe. Preprocessing is baked in at parse time and entries "
+        "are keyed by file name, so a cache dir is valid for exactly one "
+        "--data_dir at one max_num_peaks; the run aborts if either disagrees "
+        "with what the dir was built from. Use one dir per dataset.",
+    )
     parser.add_argument(
         "--run_name",
         default=None,
@@ -215,7 +228,12 @@ def main():
         f"The abele 'SSL' (genus_class=-1) files above are NOT used — "
         f"pretraining was on PRIDE."
     )
-    dfs = load_mzml_data(args.data_dir, probe_files, config.data.max_num_peaks)
+    dfs = load_mzml_data(
+        args.data_dir,
+        probe_files,
+        config.data.max_num_peaks,
+        cache_dir=args.mzml_cache_dir,
+    )
 
     probe_train_loader, probe_val_loader = build_probe_dataloaders(
         dfs, meta_df, config
@@ -276,6 +294,9 @@ def main():
                 "probe_epochs": f"{res['probe_epochs']:.1f}",
                 "probe_seed": args.probe_seed,
                 "probe_repeats": args.probe_repeats,
+                "probe_lr": args.probe_lr,
+                "probe_n_epochs": args.probe_n_epochs,
+                "probe_min_train_loss": args.probe_min_train_loss,
                 "n_probe_genera": args.n_probe_genera,
                 "n_ssl_top": args.n_ssl_top,
                 "probe_all": int(args.probe_all),
