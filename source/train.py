@@ -90,16 +90,6 @@ parser.add_argument(
     "steps). Raise it alongside --lr for large/heterogeneous training sets.",
 )
 parser.add_argument(
-    "--devices",
-    type=int,
-    default=None,
-    help="Override config.training.devices (GPUs for DDP). data.batch_size is PER "
-    "GPU, so halve it when doubling this to keep the effective batch — and the LR "
-    "schedule — unchanged. The slurm script must also use `srun` and set "
-    "--ntasks-per-node to the same number, or Lightning runs a single process while "
-    "still sharding the sampler, i.e. trains on 1/N of the data with no error.",
-)
-parser.add_argument(
     "--seed",
     type=int,
     default=42,
@@ -130,30 +120,7 @@ WARMUP_ITERS = (
 
 # Extract configuration values
 BATCH_SIZE = config.data.batch_size
-DEVICES = args.devices if args.devices is not None else config.training.devices
 ACCUMULATE_GRAD_BATCHES = config.training.accumulate_grad_batches
-
-# DDP shards the training data across ranks, and the two sharding mechanisms available
-# here behave very differently.
-#
-# The map-style (shuffled) loader is fine: Lightning injects a DistributedSampler, which
-# splits by ROW and pads the last batch, so every rank gets exactly the same number of
-# batches. --no_shuffle instead hands a depthcharge SpectrumDataset (an IterableDataset)
-# straight to the loader, and Lance self-shards those by FRAGMENT
-# (`fragments[rank::world_size]`). Fragments are one per mzML file or per build_lance.py
-# write chunk and are not equal in size, so ranks end up with different batch counts —
-# and since Lightning does not wrap the loop in DistributedDataParallel.join(), the rank
-# that finishes first stops calling all_reduce and the others hang at the epoch boundary.
-# The LR schedule is wrong too: LanceDataset has no __len__, so
-# estimated_stepping_batches is unavailable and the fallback below counts every fragment
-# rather than this rank's share, making total_steps ~world_size times too long.
-if DEVICES > 1 and args.no_shuffle:
-    raise SystemExit(
-        "--no_shuffle is single-GPU only: Lance shards IterableDatasets by fragment, "
-        "which gives ranks unequal batch counts (epoch-boundary hang) and an inflated "
-        f"total_steps. Use --devices 1, or drop --no_shuffle to use the map-style "
-        f"loader that Lightning can shard by row. (--devices {DEVICES})"
-    )
 PRECISION = config.training.precision
 CHECKPOINT_PATH = config.training.checkpoint_path
 RUN_NAME = args.run_name or config.name
@@ -249,27 +216,11 @@ else:
         num_workers=0,  # the dataset holds a live Lance handle; not fork-safe
         collate_fn=batch_collate(train_dataset),
     )
-# Validation is NEVER reshuffled (shuffle=False). `validation_step` seeds its mask
-# generator with `42 + batch_idx` so masks are identical across epochs — which only
-# holds if batch k is the same spectra every time. Shuffling here would add noise to
-# val loss and make epoch-to-epoch comparisons meaningless.
-#
-# Map-style rather than the sequential scan, for the same reason as the train loader:
-# Lightning only injects a DistributedSampler into map-style loaders, and an
-# IterableDataset here would be sharded by Lance BEHIND Lightning's back, one fragment
-# per rank. That leaves each rank validating on its own uneven slice — and a val.lance
-# with fewer than `devices` fragments leaves the higher ranks with nothing at all,
-# which fails in the sanity check. Note this changes batch composition even on one GPU
-# (fixed `batch_size` rows per batch, rather than whole Arrow batches packed greedily),
-# so val_loss shifts slightly against pre-DDP runs — as it already does whenever
-# batch_size changes, since that reseeds which peaks get masked.
-val_loader = DataLoader(
-    SpectrumIndexDataset(val_dataset),
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-    num_workers=0,  # the dataset holds a live Lance handle; not fork-safe
-    collate_fn=batch_collate(val_dataset),
-)
+# Validation is NEVER reshuffled. `validation_step` seeds its mask generator with
+# `42 + batch_idx` so masks are identical across epochs — which only holds if batch k
+# is the same spectra every time. Shuffling here would add noise to val loss and make
+# epoch-to-epoch comparisons meaningless.
+val_loader = DataLoader(val_dataset, batch_size=None, num_workers=0)
 
 # Resolve the length of the one-cycle LR schedule. OneCycleLR raises once it is
 # stepped past total_steps, so this has to be exact, not approximately right.
@@ -314,10 +265,9 @@ print(
     f"schedule_total_steps={total_steps_sched} ({derivation})"
 )
 print(
-    f"precision={PRECISION}  batch_size={BATCH_SIZE}/gpu  "
-    f"devices={DEVICES}{' (CLI)' if args.devices is not None else ' (config)'}  "
+    f"precision={PRECISION}  batch_size={BATCH_SIZE}  "
     f"accumulate_grad_batches={ACCUMULATE_GRAD_BATCHES}  "
-    f"effective_batch={BATCH_SIZE * ACCUMULATE_GRAD_BATCHES * DEVICES}  "
+    f"effective_batch={BATCH_SIZE * ACCUMULATE_GRAD_BATCHES}  "
     f"batches/epoch={batches_per_epoch}"
 )
 print(
@@ -327,17 +277,6 @@ print(
     f"(ff/d={config.model.dim_feedforward / config.model.d_model:g}) "
     f"n_layers={config.model.n_layers} n_bins={config.model.n_bins}"
 )
-if DEVICES > 1:
-    # DistributedSampler splits by row, so each rank sees ~1/DEVICES of the counts
-    # above. The schedule is still correct: auto_total_steps leaves the model
-    # preferring trainer.estimated_stepping_batches, which is measured AFTER sharding.
-    print(
-        f"  ^ counts above are pre-sharding; each of the {DEVICES} ranks sees "
-        f"~{math.ceil(batches_per_epoch / DEVICES)} batches/epoch. Confirm one "
-        f"'LOCAL_RANK: n' banner per rank in stderr — a single banner means srun / "
-        f"--ntasks-per-node is missing and this is really a 1-GPU run on "
-        f"1/{DEVICES} of the data."
-    )
 print(
     f"lr={LR}{' (CLI)' if args.lr is not None else ' (config)'}  "
     f"warmup_iters={WARMUP_ITERS}"
@@ -392,10 +331,7 @@ trainer = L.Trainer(
     default_root_dir=root_dir,
     callbacks=[checkpoint_callback],
     accelerator=config.training.accelerator,
-    devices=DEVICES,
-    # Explicit rather than "auto": with devices>1 under sbatch, "auto" resolves through
-    # SLURMEnvironment, and the failure mode is silent (see --devices help).
-    strategy="ddp" if DEVICES > 1 else "auto",
+    devices=config.training.devices,
     precision=PRECISION,
     accumulate_grad_batches=ACCUMULATE_GRAD_BATCHES,
     max_epochs=MAX_EPOCHS,

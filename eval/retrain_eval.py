@@ -209,12 +209,7 @@ def main():
         default_root_dir=root_dir,
         callbacks=callbacks,
         accelerator=config.training.accelerator,
-        # Single-GPU on purpose, not config.training.devices. The FineTuner callback
-        # iterates probe_train_loader / probe_val_loader by hand, so those loaders never
-        # pass through trainer.fit and Lightning never shards them; the probe head is
-        # not DDP-wrapped either. Under DDP every rank would fit a separate probe on the
-        # full probe set and log unsynced accuracies, making the numbers meaningless.
-        devices=1,
+        devices=config.training.devices,
         precision=config.training.precision,
         accumulate_grad_batches=config.training.accumulate_grad_batches,
         max_epochs=args.ssl_max_epochs,

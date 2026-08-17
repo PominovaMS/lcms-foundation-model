@@ -250,24 +250,17 @@ class MS1Encoder(L.LightningModule):
         loss_mz_bin = self.loss_mz_bin(pred_mz_bins, target_mz_bins)
         # loss_I = self.loss_I(pred_I, target_I)
         loss = loss_mz_bin  # + loss_I
-        # sync_dist + raw tensors (not .item()): under DDP each rank validates on its
-        # own shard, and a Python float cannot be all-reduced — so without this the
-        # logged value is rank 0's slice rather than the whole validation set. It also
-        # defuses a deadlock: ModelCheckpoint(monitor="val_loss") decides "is this the
-        # best epoch" per rank, but the save itself is a collective, so ranks that
-        # disagree hang. Single-GPU behaviour is unchanged.
-        self.log("val_loss_mz_bin", loss_mz_bin, sync_dist=True)
-        # self.log("val_loss_I", loss_I, sync_dist=True)
-        self.log("val_loss", loss, sync_dist=True)
+        self.log("val_loss_mz_bin", loss_mz_bin.item())
+        # self.log("val_loss_I", loss_I.item())
+        self.log("val_loss", loss.item())
         # Accuracy metric for mz bin prediction
         acc_mz_bin = self.val_accuracy_mz_bin(pred_mz_bins, target_mz_bins)
         self.log(
             "val_acc_mz_bin",
-            acc_mz_bin,
+            acc_mz_bin.item(),
             prog_bar=True,
             on_step=False,
             on_epoch=True,
-            sync_dist=True,
         )
         # MAE metric for intensity prediction
         # mae_I = self.val_mae_I(pred_I, target_I)

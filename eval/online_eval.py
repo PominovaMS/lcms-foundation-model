@@ -182,10 +182,7 @@ def main():
         default_root_dir=root_dir,
         callbacks=[online_finetuner],
         accelerator=config.training.accelerator,
-        # Single-GPU on purpose, not config.training.devices — see retrain_eval.py.
-        # OnlineFineTuner drives its probe loaders manually, so DDP would leave each
-        # rank with its own unsynchronised probe.
-        devices=1,
+        devices=config.training.devices,
         precision=config.training.precision,
         accumulate_grad_batches=config.training.accumulate_grad_batches,
         max_epochs=args.ssl_max_epochs,

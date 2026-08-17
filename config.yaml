@@ -7,12 +7,13 @@ name: "ms1-mz-200_peaks-sqrt-clf_run_retrain" # ms1 # retrain finetuning
 data:
   train_dir: "train_mzml"
   val_dir: "val_mzml"
-  batch_size: 512    # PER GPU under DDP: 512 x 2 devices = effective batch 1024, the
-                     # value the LR schedule was tuned at. Halved from 1024 when
-                     # dim_feedforward went to 2048 — see the memory note under training.
-                     # 2000 OOMs the 44GB L40S (fp32); with bf16-mixed there is headroom
-                     # again, but raise training.accumulate_grad_batches rather than this
-                     # if you need memory back without changing the effective batch.
+  batch_size: 512    # Halved from 1024 when dim_feedforward went to 2048 — see the
+                     # memory note under training. training.accumulate_grad_batches is
+                     # 2 to compensate, so the effective batch stays 1024, the value the
+                     # LR schedule was tuned at. 2000 OOMs the 44GB L40S (fp32); with
+                     # bf16-mixed there is headroom again, but raise
+                     # training.accumulate_grad_batches rather than this if you need
+                     # memory back without changing the effective batch.
   max_num_peaks: 200
 
 # Model configuration
@@ -49,11 +50,8 @@ training:
   max_epochs: 1000 # 200
   gradient_clip_val: 5
   accelerator: "gpu"
-  # Used by eval/retrain_eval.py and eval/online_eval.py, which must stay single-GPU
-  # (their probe callbacks iterate loaders by hand, so DDP would never shard them and
-  # each rank would train a divergent probe). train.py takes --devices instead; asimov
-  # has 4 L40S. Multi-GPU also needs `srun` + --ntasks-per-node in the slurm script —
-  # without them Lightning silently runs ONE process while still sharding the sampler.
+  # Single GPU. Read by train.py and by both eval entry points; the slurm scripts ask
+  # for a matching --gres=gpu:1.
   devices: 1
   # Saved-for-backward activations are roughly
   #   n_layers * batch * (max_num_peaks+1) * d_model * 2B * (10 + 2.5*dim_feedforward/d_model)
@@ -61,10 +59,13 @@ training:
   # 200 peaks, d_model 512 / ff 1024 needs ~28GB in bf16 and ~56GB in fp32, which is
   # what OOM'd the 44GB L40S. bf16-mixed roughly halves it and is ~1.5-2x faster.
   # Weights, Adam state, the m/z sinusoidal encoding and the cross-entropy stay fp32.
-  # ff 1024->2048 takes that to ~37GB at batch 1024, hence batch 512 above.
+  # ff 1024->2048 takes that to ~37GB at batch 1024, hence batch 512 above with
+  # accumulate_grad_batches 2 to keep the effective batch at 1024.
   # Record the precision in the run name — nothing else in the pipeline does, so an
   # fp32 and a bf16 run of the same data are otherwise indistinguishable in results.csv.
   precision: "bf16-mixed"
   # Effective batch = data.batch_size * this. Raise it (and halve batch_size) to cut
   # activation memory without touching the effective batch or the LR schedule.
-  accumulate_grad_batches: 1
+  # 512 x 2 = 1024, the effective batch the LR schedule was tuned at; one optimizer
+  # step still consumes 1024 spectra, so warmup_iters keeps its meaning.
+  accumulate_grad_batches: 2
