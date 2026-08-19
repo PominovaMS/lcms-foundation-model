@@ -7,12 +7,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as L
 from torch import Tensor
-from torchmetrics.functional import accuracy
+from torchmetrics.functional import auroc, average_precision
 
 
 class FineTuner(L.Callback):
     """
-    Retrain-style probe: re-initializes and fully retrains the linear probe
+    Retrain-style probe: re-initializes and fully retrains the linear probe on probe_train
     from scratch at the end of each SSL training epoch, then evaluates on probe_val.
 
     Trains until avg_loss < min_train_loss OR max n_epochs, whichever comes first.
@@ -34,7 +34,7 @@ class FineTuner(L.Callback):
         super().__init__()
 
         if class_weights is not None:
-            assert class_weights.size(0) == num_classes
+            assert class_weights.size(0) == num_classes, "number of class weights must equal `num_classes`"
 
         self.encoder_output_dim = encoder_output_dim
         self.num_classes = num_classes
@@ -82,10 +82,12 @@ class FineTuner(L.Callback):
             self.optimizer.step()
             self.optimizer.zero_grad()
 
-        acc = accuracy(preds, targets, task="multiclass", num_classes=self.num_classes)
+        auc = auroc(preds, targets, task="multiclass", num_classes=self.num_classes)
+        ap = average_precision(preds, targets, task="multiclass", num_classes=self.num_classes)
 
+        # Display prediction sample # TODO: make this optional with debug/verbose flag
         if not train:
-            n = 30
+            n = 20
             sample_df = np.hstack(
                 (
                     targets[:n].cpu().numpy()[:, None],
@@ -93,9 +95,9 @@ class FineTuner(L.Callback):
                 )
             )
             col_names = ["targets"] + [f"prob_{i}" for i in range(self.num_classes)]
-            print(pd.DataFrame(sample_df, columns=col_names).to_string())
+            print("\n\n", pd.DataFrame(sample_df, columns=col_names).to_string(), "\n\n")
 
-        return loss.detach(), acc.detach()
+        return loss.detach(), auc.detach(), ap.detach()
 
     def on_train_epoch_end(
         self, trainer: L.Trainer, pl_module: L.LightningModule
@@ -103,6 +105,7 @@ class FineTuner(L.Callback):
         # Only retrain + evaluate the probe every N SSL epochs to save time
         if trainer.current_epoch % self.eval_every_n_epochs != 0:
             return
+        
         self._init_model_opt(trainer, pl_module)
 
         was_training = pl_module.training
@@ -110,31 +113,35 @@ class FineTuner(L.Callback):
         self.finetuner.train()
 
         probe_epoch = 0
-        avg_loss = float(
-            "inf"
-        )  # start high so the while condition enters on first iteration
-        avg_acc = 0.0
+        avg_loss = float("inf")
+        avg_auc, avg_ap = 0.0, 0.0
 
         while (avg_loss > self.min_train_loss) and (
             self.n_epochs is None or probe_epoch < self.n_epochs
         ):
-            total_loss, total_acc, n_batches = 0.0, 0.0, 0
+            total_loss, total_auc, total_ap, n_batches = 0.0, 0.0, 0.0, 0
             for batch in self.probe_train_loader:
-                loss, acc = self._step(pl_module, batch, train=True)
+                loss, auc, ap = self._step(pl_module, batch, train=True)
                 total_loss += float(loss)
-                total_acc += float(acc)
+                total_auc += float(auc)
+                total_ap += float(ap)
                 n_batches += 1
 
             avg_loss = total_loss / n_batches
-            avg_acc = total_acc / n_batches
-            print(f"Probe epoch {probe_epoch} loss: {avg_loss:.4f}  acc: {avg_acc:.4f}")
+            avg_auc = total_auc / n_batches
+            avg_ap = total_ap / n_batches
+            print(f"Probe epoch {probe_epoch} loss: {avg_loss:.4f}  auc: {avg_auc:.4f}  ap: {avg_ap:.4f}")
             probe_epoch += 1
 
+        # Log final train metrics
         pl_module.log(
             "retrain_train_loss", avg_loss, on_step=False, on_epoch=True, prog_bar=False
         )
         pl_module.log(
-            "retrain_train_acc", avg_acc, on_step=False, on_epoch=True, prog_bar=False
+            "retrain_train_auc", avg_auc, on_step=False, on_epoch=True, prog_bar=False
+        )
+        pl_module.log(
+            "retrain_train_ap", avg_ap, on_step=False, on_epoch=True, prog_bar=False
         )
 
         if was_training:
@@ -155,22 +162,28 @@ class FineTuner(L.Callback):
         pl_module.eval()
         self.finetuner.eval()
 
-        total_loss, total_acc, n_batches = 0.0, 0.0, 0
+        total_loss, total_auc, total_ap, n_batches = 0.0, 0.0, 0.0, 0
         with torch.no_grad():
             for batch in self.probe_val_loader:
-                loss, acc = self._step(pl_module, batch, train=False)
+                loss, auc, ap = self._step(pl_module, batch, train=False)
                 total_loss += float(loss)
-                total_acc += float(acc)
+                total_auc += float(auc)
+                total_ap += float(ap)
                 n_batches += 1
 
         avg_loss = total_loss / n_batches
-        avg_acc = total_acc / n_batches
+        avg_auc = total_auc / n_batches
+        avg_ap = total_ap / n_batches
 
+         # Log validation metrics
         pl_module.log(
             "retrain_val_loss", avg_loss, on_step=False, on_epoch=True, prog_bar=False
         )
         pl_module.log(
-            "retrain_val_acc", avg_acc, on_step=False, on_epoch=True, prog_bar=True
+            "retrain_val_auc", avg_auc, on_step=False, on_epoch=True, prog_bar=True
+        )
+        pl_module.log(
+            "retrain_val_ap", avg_ap, on_step=False, on_epoch=True, prog_bar=True
         )
 
         if was_training:
@@ -246,7 +259,8 @@ class OnlineFineTuner(L.Callback):
             self.optimizer.step()
             self.optimizer.zero_grad()
 
-        acc = accuracy(preds, targets, task="multiclass", num_classes=self.num_classes)
+        auc = auroc(preds, targets, task="multiclass", num_classes=self.num_classes)
+        ap = average_precision(preds, targets, task="multiclass", num_classes=self.num_classes)
 
         if not train:
             n = 30
@@ -259,7 +273,7 @@ class OnlineFineTuner(L.Callback):
             col_names = ["targets"] + [f"prob_{i}" for i in range(self.num_classes)]
             print(pd.DataFrame(sample_df, columns=col_names).to_string())
 
-        return loss.detach(), acc.detach()
+        return loss.detach(), auc.detach(), ap.detach()
 
     def on_train_epoch_end(
         self, trainer: L.Trainer, pl_module: L.LightningModule
@@ -268,21 +282,26 @@ class OnlineFineTuner(L.Callback):
         pl_module.eval()
         pl_module.online_finetuner.train()
 
-        total_loss, total_acc, n_batches = 0.0, 0.0, 0
+        total_loss, total_auc, total_ap, n_batches = 0.0, 0.0, 0.0, 0
         for batch in self.probe_train_loader:
-            loss, acc = self._step(pl_module, batch, train=True)
+            loss, auc, ap = self._step(pl_module, batch, train=True)
             total_loss += float(loss)
-            total_acc += float(acc)
+            total_auc += float(auc)
+            total_ap += float(ap)
             n_batches += 1
 
         avg_loss = total_loss / n_batches
-        avg_acc = total_acc / n_batches
+        avg_auc = total_auc / n_batches
+        avg_ap = total_ap / n_batches
 
         pl_module.log(
             "online_train_loss", avg_loss, on_step=False, on_epoch=True, prog_bar=False
         )
         pl_module.log(
-            "online_train_acc", avg_acc, on_step=False, on_epoch=True, prog_bar=False
+            "online_train_auc", avg_auc, on_step=False, on_epoch=True, prog_bar=False
+        )
+        pl_module.log(
+            "online_train_ap", avg_ap, on_step=False, on_epoch=True, prog_bar=False
         )
 
         if was_training:
@@ -295,22 +314,27 @@ class OnlineFineTuner(L.Callback):
         pl_module.eval()
         pl_module.online_finetuner.eval()
 
-        total_loss, total_acc, n_batches = 0.0, 0.0, 0
+        total_loss, total_auc, total_ap, n_batches = 0.0, 0.0, 0.0, 0
         with torch.no_grad():
             for batch in self.probe_val_loader:
-                loss, acc = self._step(pl_module, batch, train=False)
+                loss, auc, ap = self._step(pl_module, batch, train=False)
                 total_loss += float(loss)
-                total_acc += float(acc)
+                total_auc += float(auc)
+                total_ap += float(ap)
                 n_batches += 1
 
         avg_loss = total_loss / n_batches
-        avg_acc = total_acc / n_batches
+        avg_auc = total_auc / n_batches
+        avg_ap = total_ap / n_batches
 
         pl_module.log(
             "online_val_loss", avg_loss, on_step=False, on_epoch=True, prog_bar=False
         )
         pl_module.log(
-            "online_val_acc", avg_acc, on_step=False, on_epoch=True, prog_bar=True
+            "online_val_auc", avg_auc, on_step=False, on_epoch=True, prog_bar=True
+        )
+        pl_module.log(
+            "online_val_ap", avg_ap, on_step=False, on_epoch=True, prog_bar=True
         )
 
         if was_training:

@@ -1,13 +1,12 @@
 # Experiment configuration
 name: "ms1-mz-200_peaks-sqrt-clf_run_retrain" # ms1 # retrain finetuning
 # name: "ms1-mz-200_peaks-sqrt-clf_run" # ms1 # online finetuning
-# name: "ms1-mz-pos-200_peaks-sqrt" # ms1
 
 # Data configuration
 data:
   train_dir: "train_mzml"
   val_dir: "val_mzml"
-  batch_size: 2000
+  batch_size: 1000 # 2000
   max_num_peaks: 200
 
 # Model configuration
