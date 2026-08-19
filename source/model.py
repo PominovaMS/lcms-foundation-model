@@ -1,5 +1,4 @@
 import numpy as np
-import pandas as pd  # DEBUG
 import torch
 import torch.nn as nn
 import torchmetrics
@@ -7,9 +6,6 @@ import pytorch_lightning as L
 from depthcharge.encoders import PeakEncoder, PositionalEncoder
 from depthcharge.transformers import SpectrumTransformerEncoder
 from .scheduler import CosineWarmupScheduler
-
-# from IPython.display import clear_output # DEBUG
-# pd.set_option('display.max_rows', 500) # DEBUG
 
 
 class MS1Encoder(L.LightningModule):
