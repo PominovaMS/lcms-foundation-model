@@ -77,16 +77,19 @@ class MS1Encoder(L.LightningModule):
         if proportional:
             k = int(intensities.size(1) * self.masked_peaks_fraction)
             mask = torch.zeros_like(intensities, dtype=torch.bool)
-            # FIXME: assume we have no zero rows (= spectra with no peaks)
 
-            # compute sampling weights w
+            # Compute sampling weights w
+            # Note: it's assumed to always have at least one peak in a spectrum.
+
+            # Compute mean I of real spectrum peaks
             I_mean = intensities.sum(dim=1) / (intensities != 0).sum(
                 dim=1
-            )  # mean I of non-zero peaks
+            )
+            # Compute sampling weights; weight padding peaks by mean I
             w = (
                 intensities + (intensities == 0).float() * I_mean[:, None]
-            )  # weight 0s by mean I
-            # sample k indices without replacement, weighted by w
+            )  
+            # Sample k indices without replacement, weighted by w
             idx = torch.multinomial(
                 w, num_samples=k, replacement=False, generator=generator
             )
@@ -107,13 +110,15 @@ class MS1Encoder(L.LightningModule):
         return mask
 
     def get_mz_bins(self, mz):
-        # every peak with mz > bin_mz_max will belong to max bin
+        # Every peak with mz > bin_mz_max will belong to the max bin
         mz = mz.clamp(0, self.bin_mz_max - 1)
         mz_binned = (
             ((mz - self.bin_mz_min) / (self.bin_mz_max - self.bin_mz_min) * self.n_bins)
             .floor()
             .long()
         )
+        # Ignore any peaks with mz below the defined range 
+        # (including padding "peaks" with mz=0)
         mz_binned[mz < self.bin_mz_min] = -1
         return mz_binned
 
