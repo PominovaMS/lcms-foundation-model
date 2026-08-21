@@ -3,7 +3,6 @@ import lance
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
-from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 
 
@@ -22,35 +21,35 @@ class LanceMapDataset(Dataset):
         self.lance_path = str(lance_path)
         self.seq_len = seq_len
 
-        self._ds = (
-            self._get_ds()
-        )  # must be moved from __init__ to __getitem__ if num_workers>0
-        self._n = lance.dataset(self.lance_path).count_rows()
+        self._ds = self._get_ds() # must be moved from __init__ to __getitem__ if num_workers>0
+        self._n = self._ds.count_rows()
 
     def __len__(self):
         return self._n
 
     def __getitem__(self, idx):
-        item_dict = self._ds.take([int(idx)]).to_pydict()
-        item_dict = {k: v[0] for k, v in item_dict.items()}
-        item_dict["mz_array"] = np.array(item_dict["mz_array"], dtype=np.float32)
-        item_dict["intensity_array"] = np.array(
-            item_dict["intensity_array"], dtype=np.float32
-        )
+        return self.__getitems__([idx])[0]
 
-        # pad peaks sequence to seq_len (FIXME: move to collate_fn?)
-        if self.seq_len is not None and len(item_dict["mz_array"]) < self.seq_len:
-            pad_right = self.seq_len - len(item_dict["mz_array"])
-            item_dict["mz_array"] = np.pad(item_dict["mz_array"], (0, pad_right))
-            item_dict["intensity_array"] = np.pad(
-                item_dict["intensity_array"], (0, pad_right)
-            )
+    def __getitems__(self, indices: list[int]) -> list:
+        items = self._ds.take([int(i) for i in indices]).to_pylist()
+        return [self._prepare_item(item) for item in items]
 
-        return item_dict
+    def _prepare_item(self, item):
+        item["mz_array"] = np.asarray(item["mz_array"], dtype=np.float32)
+        item["mz_array"] = self._pad_sequence(item["mz_array"])
+
+        item["intensity_array"] = np.asarray(item["intensity_array"], dtype=np.float32)
+        item["intensity_array"] = self._pad_sequence(item["intensity_array"])
+        return item
 
     def _get_ds(self):
-        self._ds = lance.dataset(self.lance_path)
-        return self._ds
+        return lance.dataset(self.lance_path)
+
+    def _pad_sequence(self, sequence):
+        if self.seq_len is not None and len(sequence) < self.seq_len:
+            pad_right = self.seq_len - len(sequence)
+            return np.pad(sequence, (0, pad_right))
+        return sequence
 
 
 class RunDataset(Dataset):
