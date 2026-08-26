@@ -144,15 +144,18 @@ is the same spectra every time. Shuffling val would add noise to val loss and ma
 epoch-to-epoch comparisons meaningless.
 
 Checkpoints (including a stable `last.ckpt`) are written under
-`train_checkpoints/foundation_model/lightning_logs/<run_name>/checkpoints/`.
+`train_checkpoints/foundation_model/lightning_logs/<run_name>/checkpoints/`. Only
+best-`val_loss` and `last.ckpt` survive by default; add `--save_every_n_epochs N` to
+also keep a weights-only checkpoint per N epochs under `checkpoints/epochs/`, which is
+what step 4 needs to plot probe accuracy against pretraining epoch.
 
 ### 4. Evaluate each checkpoint downstream — `eval/probe_checkpoint.py`
 
 Loads a pretrained checkpoint, freezes the encoder, trains a fresh linear probe on
 the abele genus task, and reports validation accuracy. Point `--results_csv` at the
 **same file** for every stage to accumulate the scaling curve. Keep
-`--n_probe_genera`, `--n_ssl_top`, `--max_files_per_species` and
-`--max_files_per_genus` identical across stages so the probe split is fixed.
+`--probe_label`, `--n_classes`, `--val_frac` and `--label_offset` identical across
+stages so the probe split is fixed.
 
 ```bash
 python eval/probe_checkpoint.py \
@@ -161,12 +164,43 @@ python eval/probe_checkpoint.py \
     --meta_path /mnt/data/shared/lc_ms_foundation/abele_data/all_abele_metadata.csv \
     --config config.yaml \
     --run_name stage03 \
+    --probe_label genus --n_classes 2 --val_frac 0.3 --label_offset 0 \
+    --mzml_cache_dir /mnt/data/cadams/cache/abele_mzml \
     --results_csv sweep.csv
 ```
+
+`--encode_chunk_size` (512) is how many spectra go through the encoder in one
+forward pass. It is not an eval setting — chunking is exact, so it changes only
+whether the numbers compute, never what they are — but a whole LC-MS run in a
+single forward is tens of GB of activations and OOMs the GPU. Lower it if the
+encoder still runs out of memory; the log prints the per-run spectrum counts.
+
+`--mzml_cache_dir` writes one parquet per parsed mzML and reloads them on later
+runs. The ~450-file parse dominates the runtime of a probe, so only the first
+invocation pays it. A cache dir is valid for exactly one `(--data_dir,
+max_num_peaks)` pair and the run aborts if either disagrees.
 
 `sweep.csv` gains one row per stage — plot `probe_val_acc` against the number of
 pretraining datasets to read off the curve. Every split and probe setting is
 recorded alongside the metrics, so a row is self-describing.
+
+#### Probe accuracy vs. pretraining epoch
+
+`--ckpt_path` takes any checkpoint, so the series from `train.py --save_every_n_epochs`
+answers "how much pretraining does the downstream task actually need?" on a single run.
+Each row records `ssl_epoch` / `ssl_step`, read out of the checkpoint, so one `run_name`
+and one CSV are enough:
+
+```bash
+# one array task per saved epoch; all share MZML_CACHE, so only the first parses mzML
+sbatch --array=0-9 --export=ALL,RUN=<run_name>,CKPT_GLOB=1 run_probe.slurm
+python scripts/plot_sweep.py --results_csv results/probe/<run_name>.csv \
+    --x ssl_epoch -o epochs.png
+```
+
+Use a **fresh** CSV under `results/probe/`, not the sweep's `results/<run>.csv`: these
+rows vary pretraining time rather than data, and the default `--x stage` axis would
+read them as extra diversity stages.
 
 #### Reading the numbers
 
@@ -185,30 +219,56 @@ that predicts one class for every run can still post a respectable micro accurac
 | `random_acc` | `1 / n_probe_classes` |
 | `n_pred_classes` | distinct classes predicted on val; **1 means collapsed** |
 
+**The bar is `majority_acc` (~0.70), not `random_acc` (0.50)** — the default
+2-genus split is deliberately unbalanced (see below), so a probe scoring 0.65 is
+worse than predicting "Pseudomonas" every time. Read `probe_val_acc_macro` and
+`n_pred_classes` alongside `probe_val_acc`.
+
 `probe_epochs` distinguishes a third case: if it pins at `--probe_n_epochs`, the
 probe never reached `--probe_min_train_loss` and is *underfit*, not collapsed.
 
-#### Probe class balance
+#### The probe split
 
-`assign_splits` alternates *species* between probe train and val, which assumes
-species carry comparable file counts. In abele they do not — 80 of the 87 probe
-species have 3 files, but *Escherichia coli* has 48, and being alphabetically
-first it always lands in probe_train. Left uncapped it is 25% of probe_train and
-2.3% of probe_val, so a probe that collapses onto it scores *below* random.
+`assign_splits` takes the `--n_classes` (2) most abundant `--probe_label` values
+(`genus` by default; `species` reads the `organism` column), dropping
+`genus == "food"` — a sample type, not an organism. On abele that is Pseudomonas
+(312 files) and Staphylococcus (136). Each class's **own** files are then split
+`--val_frac` (0.3) into train/val, with val indices chosen by `stride` — evenly
+spaced across the sorted file list rather than a contiguous prefix, so val samples
+across acquisition order. Every other file is `split="unused"` and read by nothing.
 
-`--max_files_per_species` (default 3, the modal count) caps each species within
-each probe split, keeping evenly-strided files rather than a prefix. Capped-out
-files become `split="unused"` and are read by nothing — in particular they are
-**not** donated to the SSL split, which would leak probe genera into pretraining.
+| | files | train | val |
+| --- | --- | --- | --- |
+| Pseudomonas | 312 | 218 | 94 |
+| Staphylococcus | 136 | 95 | 41 |
+| **total** | **448** | **313** | **135** |
 
-| setting | train | val | train-vs-val TV | `majority_acc` |
-| --- | --- | --- | --- | --- |
-| `--max_files_per_species 0` (no cap) | 192 | 132 | 0.232 | 0.023 |
-| `--max_files_per_species 3` (default) | 141 | 120 | 0.082 | 0.175 |
-| `... 3 --max_files_per_genus 6` | 87 | 87 | 0.000 | 0.069 |
+Nothing is reserved for SSL — pretraining runs on PRIDE, so abele is purely an
+evaluation set and there is no `"train"` split. Classes are not balanced or capped
+either: they keep their natural 2.3:1 ratio, hence `majority_acc ≈ 0.70`. Because
+the split is proportional, train and val carry the *same* class distribution, which
+is what makes `majority_acc` a well-behaved collapse threshold.
 
-The per-genus cap balances the classes exactly, at roughly half the files. Numbers
-produced under different caps are not comparable.
+`--label_offset` shifts that selection down the ranking: `--label_offset 1` skips
+the largest label and probes #2 + #3 instead — Staphylococcus (136) + Bacillus
+(109), 245 files at 1.25:1. That is the lever for the imbalance, and it lowers
+`majority_acc` to ~0.55, so **compare `majority_acc` across rows, not just
+`probe_val_acc`**: an offset row can score lower and still be the better result.
+The cost is 245 files instead of 448, so `probe_val_acc` is coarser. At
+`--probe_label species` the second- and third-largest species may sit in the same
+genus, which makes it a within-genus task — a different question, not comparable
+with the genus rows. `class_names` records exactly what was selected, so the offset
+gets no CSV column of its own. The split log prints the label ranking with the
+selected rows marked; read it before picking an offset.
+
+**What this measures.** Train and val share species by construction, so this is
+"same species, unseen run", not cross-species generalisation — deliberately the
+lower-variance sanity check on whether the encoder carries organism information at
+all. Pseudomonas is also near-monospecific, so in practice it is *P. aeruginosa* vs
+assorted Staphylococcus. `assign_splits` logs each class's per-species train/val
+counts; that log is the only record of the composition, so read it before drawing
+conclusions. Numbers from the older species-alternating split are not comparable
+with these, and the results CSV header changed with it — write to a fresh file.
 
 ## Data QC — `mass_dist.py`
 

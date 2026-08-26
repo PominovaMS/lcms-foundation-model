@@ -1,15 +1,36 @@
 """Evaluate a *pretrained* MS1Encoder checkpoint with a downstream linear probe.
 
 Loads a checkpoint (e.g. one pretrained on a PRIDE training set), freezes the
-encoder, trains a fresh linear probe on the abele genus-classification task, and
-reports validation accuracy. Unlike ``eval/retrain_eval.py`` this does NOT run any
-SSL training — it only probes the representation the checkpoint already learned.
+encoder, trains a fresh linear probe on the abele organism-classification task, and
+reports validation accuracy. No SSL training happens here — it only probes the
+representation the checkpoint already learned.
 
-Keep ``--n_probe_genera`` / ``--n_ssl_top`` / ``--max_files_per_species`` /
-``--max_files_per_genus`` identical across runs so the abele probe split (from
-``assign_splits``) is fixed and stages are comparable. Every one of them is
-recorded in ``--results_csv`` so a row is self-describing. Point ``--results_csv``
-at the same file across stages to accumulate the scaling curve.
+The default task is the **2 largest abele genera** (Pseudomonas 312 files vs
+Staphylococcus 136), each genus's files split proportionally into train/val by
+``assign_splits``. The classes are deliberately left unbalanced, so the bar to beat
+is ``majority_acc`` (~0.70), NOT ``random_acc`` (0.50) — read
+``probe_val_acc_macro`` and ``n_pred_classes`` alongside ``probe_val_acc``.
+
+``--label_offset`` shifts the selection down the ranking: ``--label_offset 1``
+probes the second- and third-largest labels instead, which lowers ``majority_acc``
+when the largest label dwarfs the rest, at the cost of fewer files.
+
+Keep ``--probe_label`` / ``--n_classes`` / ``--val_frac`` / ``--label_offset``
+identical across runs so the probe split is fixed and stages are comparable. The
+first three and the resulting ``class_names`` are recorded in ``--results_csv`` so
+a row is self-describing. Point ``--results_csv`` at the same file across stages to
+accumulate the scaling curve.
+
+NOTE: the CSV header changed with the split rewrite (the five ``n_probe_genera`` /
+``n_ssl_top`` / ``probe_all`` / ``max_files_per_*`` columns became ``probe_label`` /
+``n_classes`` / ``val_frac`` / ``class_names``, and ``ssl_epoch`` / ``ssl_step`` were
+added). Point ``--results_csv`` at a fresh file; rows written under the old split are
+not comparable with these anyway.
+
+``ssl_epoch`` / ``ssl_step`` are read out of the checkpoint, so probing several
+checkpoints of ONE pretraining run (``train.py --save_every_n_epochs``) into one CSV
+gives probe accuracy as a function of pretraining epoch without needing a distinct
+``--run_name`` per row.
 
 Accuracy is reported as a mean over ``--probe_repeats`` seeded probe fits. Compare
 runs only when their gap exceeds ``probe_val_acc_std``; below that it is probe
@@ -21,6 +42,7 @@ Usage:
         --data_dir /mnt/data/shared/lc_ms_foundation/abele_data/mzml \\
         --meta_path /path/to/all_abele_metadata.csv \\
         --config config.yaml \\
+        --probe_label genus --n_classes 2 \\
         --results_csv sweep.csv
 """
 
@@ -74,12 +96,17 @@ def load_config(config_path):
 def append_result(results_csv: str, row: dict) -> None:
     """Append one result row, writing a header first if the file is new.
 
-    The original five columns keep their names and positions so CSVs written by
-    earlier versions still parse; everything added since is appended after them.
+    The first five columns keep their names and positions, so ``plot_sweep.py``
+    (which reads only ``run_name`` and ``probe_val_acc``) is unaffected by the
+    split-flag columns changing.
     """
     fieldnames = [
         "run_name",
         "ckpt_path",
+        # which point of PRETRAINING this checkpoint is — read out of the checkpoint
+        # itself, so an epoch sweep's rows are distinguishable under one run_name
+        "ssl_epoch",
+        "ssl_step",
         "n_probe_classes",
         "probe_val_acc",
         "probe_val_loss",
@@ -98,11 +125,10 @@ def append_result(results_csv: str, row: dict) -> None:
         "probe_lr",
         "probe_n_epochs",
         "probe_min_train_loss",
-        "n_probe_genera",
-        "n_ssl_top",
-        "probe_all",
-        "max_files_per_species",
-        "max_files_per_genus",
+        "probe_label",
+        "n_classes",
+        "val_frac",
+        "class_names",
         "n_probe_train_files",
         "n_probe_val_files",
     ]
@@ -112,6 +138,20 @@ def append_result(results_csv: str, row: dict) -> None:
         if is_new:
             writer.writeheader()
         writer.writerow(row)
+
+
+def infer_run_name(ckpt_path: str) -> str:
+    """The pretraining --run_name a checkpoint belongs to, from its path.
+
+    train.py writes ``<run_name>/checkpoints/last.ckpt`` and, under
+    ``--save_every_n_epochs``, ``<run_name>/checkpoints/epochs/epochNNN-*.ckpt``, so
+    the run name is not at a fixed depth. Skip the structural dirs instead of
+    counting parents, or every periodic checkpoint is labelled "checkpoints".
+    """
+    for parent in Path(ckpt_path).resolve().parents:
+        if parent.name not in ("checkpoints", "epochs"):
+            return parent.name
+    return Path(ckpt_path).stem
 
 
 def main():
@@ -147,34 +187,40 @@ def main():
         help="If set, append a result row (run_name, ckpt, acc, loss) to this CSV",
     )
     # Split control — keep fixed across stages for a comparable probe split.
-    parser.add_argument("--n_probe_genera", type=int, default=15)
-    parser.add_argument("--n_ssl_top", type=int, default=3)
     parser.add_argument(
-        "--probe_all",
-        action="store_true",
-        help="Probe on ALL eligible abele genera instead of the 15 mid-sized ones "
-        "(ignores --n_probe_genera / --n_ssl_top). Richer eval, but slower and not "
-        "comparable to the default 15-genera numbers.",
+        "--probe_label",
+        choices=["genus", "species"],
+        default="genus",
+        help="What the probe classifies. Default 'genus': the 2 largest abele "
+        "genera are Pseudomonas (312 files) and Staphylococcus (136), against a "
+        "modal 3 files per species elsewhere in the set.",
     )
-    # Probe class balance — see assign_splits' "Probe class balance" docstring.
-    # Uncapped, Escherichia coli's 48 files are 25% of probe_train but 2.3% of
-    # probe_val, which lets the probe collapse onto a near-useless class.
     parser.add_argument(
-        "--max_files_per_species",
+        "--n_classes",
         type=int,
-        default=3,
-        help="Cap files per species within each probe split (0 = no cap). Default "
-        "3, the modal abele count, which keeps probe train/val class balance "
-        "comparable at the cost of only the redundant E. coli replicates.",
+        default=2,
+        help="Number of classes: the N most abundant labels by file count, ties "
+        "broken alphabetically.",
     )
     parser.add_argument(
-        "--max_files_per_genus",
+        "--label_offset",
         type=int,
         default=0,
-        help="Additionally cap files per genus within each probe split (0 = no "
-        "cap). Set to balance the classes exactly, at roughly half the files.",
+        help="Skip this many labels from the top before selecting. 0 (default) is "
+        "the plain top-N; --label_offset 1 --n_classes 2 probes the second- and "
+        "third-largest labels, which lowers majority_acc when the largest label "
+        "dwarfs the rest, at the cost of fewer files. Keep it fixed across a "
+        "sweep, like --probe_label / --n_classes / --val_frac.",
     )
-    # Probe hyperparameters (match eval/retrain_eval.py defaults).
+    parser.add_argument(
+        "--val_frac",
+        type=float,
+        default=0.3,
+        help="Fraction of EACH class's files held out for probe validation. The "
+        "split is proportional, so train and val carry the same class "
+        "distribution and share species.",
+    )
+    # Probe hyperparameters.
     parser.add_argument("--probe_lr", type=float, default=1e-2)
     parser.add_argument("--probe_n_epochs", type=int, default=100)
     parser.add_argument("--probe_min_train_loss", type=float, default=0.3)
@@ -192,6 +238,15 @@ def main():
         "is the noise floor for comparing two checkpoints. Default 3.",
     )
     parser.add_argument(
+        "--encode_chunk_size",
+        type=int,
+        default=512,
+        help="Spectra per forward pass when embedding a run. A whole LC-MS run in "
+        "one forward needs tens of GB and OOMs the GPU; chunking is exact, so this "
+        "changes only whether the numbers compute, never what they are. Lower it "
+        "if the encoder still OOMs.",
+    )
+    parser.add_argument(
         "--device",
         default=None,
         help="torch device (default: cuda if available else cpu)",
@@ -199,34 +254,31 @@ def main():
     args = parser.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    run_name = args.run_name or Path(args.ckpt_path).resolve().parent.parent.name
+    run_name = args.run_name or infer_run_name(args.ckpt_path)
 
     config = load_config(args.config)
 
     # Load and split metadata (deterministic — same split every run).
+    label_col = "organism" if args.probe_label == "species" else "genus"
     meta_df = load_metadata(args.meta_path)
     meta_df = assign_splits(
         meta_df,
-        n_probe_genera=args.n_probe_genera,
-        n_ssl_top=args.n_ssl_top,
-        probe_all=args.probe_all,
-        max_files_per_species=args.max_files_per_species or None,
-        max_files_per_genus=args.max_files_per_genus or None,
+        n_classes=args.n_classes,
+        label_col=label_col,
+        val_frac=args.val_frac,
+        label_offset=args.label_offset,
     )
 
-    # Load ONLY the probe files (skip the abele SSL corpus — not needed here).
-    # NOTE: the "SSL: ... genera" line above is assign_splits' abele-internal split.
-    # Here the encoder was pretrained on PRIDE, so those genus_class=-1 files are
-    # NOT used — only the probe_train/probe_val files below are loaded.
+    # Load ONLY the selected classes' files; everything else is split="unused".
     probe_files = meta_df.filter(
         pl.col("split").is_in(["probe_train", "probe_val"])
     )["peak_file"].to_list()
-    n_probe_genera = meta_df.filter(pl.col("genus_class") >= 0)["genus_class"].n_unique()
+    class_names = ";".join(
+        sorted(meta_df.filter(pl.col("label_class") >= 0)[label_col].unique().to_list())
+    )
     logger.info(
-        f"Downstream probe: {n_probe_genera} genera / {len(probe_files)} files "
-        f"({'all eligible' if args.probe_all else 'mid-sized subset'}). "
-        f"The abele 'SSL' (genus_class=-1) files above are NOT used — "
-        f"pretraining was on PRIDE."
+        f"Downstream probe: {args.n_classes} {args.probe_label} classes "
+        f"({class_names}) / {len(probe_files)} files."
     )
     dfs = load_mzml_data(
         args.data_dir,
@@ -243,11 +295,17 @@ def main():
         f"val: {len(probe_val_loader.dataset)}"
     )
 
-    num_probe_classes = meta_df.filter(meta_df["genus_class"] >= 0)[
-        "genus_class"
+    num_probe_classes = meta_df.filter(meta_df["label_class"] >= 0)[
+        "label_class"
     ].n_unique()
 
     logger.info(f"Loading checkpoint: {args.ckpt_path}")
+    # Lightning stores the epoch/step it was written at; read them rather than parsing
+    # the filename, which differs between the best-val_loss and the periodic callbacks.
+    ckpt_meta = torch.load(args.ckpt_path, map_location="cpu", weights_only=False)
+    ssl_epoch = ckpt_meta.get("epoch", "")
+    ssl_step = ckpt_meta.get("global_step", "")
+    del ckpt_meta
     model = MS1Encoder.load_from_checkpoint(args.ckpt_path, map_location=device)
     model.eval()
     model.to(device)
@@ -265,8 +323,12 @@ def main():
         device=device,
         seed=args.probe_seed,
         n_repeats=args.probe_repeats,
+        chunk_size=args.encode_chunk_size,
     )
 
+    logger.info(
+        f"[{run_name}] ssl_epoch={ssl_epoch} ssl_step={ssl_step}"
+    )
     logger.info(
         f"[{run_name}] probe_val_acc={res['val_acc']:.4f}±{res['val_acc_std']:.4f}  "
         f"macro={res['val_acc_macro']:.4f}±{res['val_acc_macro_std']:.4f}  "
@@ -282,6 +344,8 @@ def main():
             {
                 "run_name": run_name,
                 "ckpt_path": args.ckpt_path,
+                "ssl_epoch": ssl_epoch,
+                "ssl_step": ssl_step,
                 "n_probe_classes": num_probe_classes,
                 "probe_val_acc": f"{res['val_acc']:.6f}",
                 "probe_val_loss": f"{res['val_loss']:.6f}",
@@ -297,11 +361,10 @@ def main():
                 "probe_lr": args.probe_lr,
                 "probe_n_epochs": args.probe_n_epochs,
                 "probe_min_train_loss": args.probe_min_train_loss,
-                "n_probe_genera": args.n_probe_genera,
-                "n_ssl_top": args.n_ssl_top,
-                "probe_all": int(args.probe_all),
-                "max_files_per_species": args.max_files_per_species,
-                "max_files_per_genus": args.max_files_per_genus,
+                "probe_label": args.probe_label,
+                "n_classes": args.n_classes,
+                "val_frac": args.val_frac,
+                "class_names": class_names,
                 "n_probe_train_files": len(probe_train_loader.dataset),
                 "n_probe_val_files": len(probe_val_loader.dataset),
             },

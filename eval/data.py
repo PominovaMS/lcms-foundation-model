@@ -7,10 +7,10 @@ import os
 import numpy as np
 import polars as pl
 import torch
-from depthcharge.data import SpectrumDataset, spectra_to_df, preprocessing
+from depthcharge.data import spectra_to_df, preprocessing
 from torch.utils.data import DataLoader
 
-from source.dataset import LanceMapDataset, RunDataset
+from source.dataset import RunDataset
 
 logger = logging.getLogger(__name__)
 
@@ -42,226 +42,177 @@ def load_metadata(meta_path: str) -> pl.DataFrame:
     return meta_df
 
 
-def _split_counts(meta_df: pl.DataFrame, split: str) -> dict[str, int]:
-    """Number of files per genus in one split."""
-    counts = meta_df.filter(pl.col("split") == split).group_by("genus").agg(
-        pl.len().alias("n")
-    )
-    return dict(zip(counts["genus"].to_list(), counts["n"].to_list()))
+def _log_class_composition(meta_df: pl.DataFrame, label: str, cls: int) -> None:
+    """Log one class's train/val file counts, broken down by species.
 
-
-def _cap_probe_files(
-    meta_df: pl.DataFrame, group_cols: list[str], cap: int
-) -> pl.DataFrame:
-    """Mark all but ``cap`` evenly-strided files per group as ``split="unused"``.
-
-    Only rows already in a probe split are considered — the SSL ("train") split is
-    never capped. Files are ordered by ``peak_file`` and sampled with :func:`stride`
-    rather than truncated, so the kept files spread across the acquisition order
-    instead of clustering in whatever batch happens to sort first.
+    The per-species breakdown is the point: a genus can be one heavily replicated
+    species or forty species with three files each, and the two make ``val_acc``
+    mean very different things. Nothing in the repo records this, so the split log
+    is where it surfaces.
     """
-    probe_splits = ["probe_train", "probe_val"]
-    probe = meta_df.filter(pl.col("split").is_in(probe_splits))
-
-    groups: dict[tuple, list[str]] = {}
-    for row in probe.select([*group_cols, "peak_file"]).iter_rows():
-        groups.setdefault(row[:-1], []).append(row[-1])
-
-    keep: set[str] = set()
-    for files in groups.values():
-        files = sorted(files)
-        keep.update(files[i] for i in stride(len(files), cap))
-
-    return meta_df.with_columns(
-        pl.when(
-            pl.col("split").is_in(probe_splits)
-            & ~pl.col("peak_file").is_in(list(keep))
-        )
-        .then(pl.lit("unused"))
-        .otherwise(pl.col("split"))
-        .alias("split")
+    rows = meta_df.filter(pl.col("split").is_in(["probe_train", "probe_val"]))
+    n_train = rows.filter(pl.col("split") == "probe_train").height
+    n_val = rows.filter(pl.col("split") == "probe_val").height
+    species = sorted(rows["organism"].unique().to_list())
+    logger.info(
+        f"  [{cls}] {label:<25s} {n_train + n_val:>4d} files "
+        f"({n_train} train / {n_val} val), {len(species)} species"
     )
+    for sp in species:
+        sp_rows = rows.filter(pl.col("organism") == sp)
+        logger.info(
+            f"        {sp:<38s} "
+            f"{sp_rows.filter(pl.col('split') == 'probe_train').height:>3d} train / "
+            f"{sp_rows.filter(pl.col('split') == 'probe_val').height:>3d} val"
+        )
+
+
+def _log_label_counts(
+    counts: pl.DataFrame,
+    selected: list[str],
+    label_col: str,
+    n_classes: int,
+    label_offset: int,
+    top: int = 10,
+) -> None:
+    """Log the largest labels and mark the selected ones.
+
+    The runner-up matters: it is the input to ``--label_offset``, and at
+    ``label_col="organism"`` these per-species file counts are written down
+    nowhere else in the repo.
+    """
+    shown = min(top, counts.height)
+    scope = (
+        f"top {shown} of {counts.height}" if shown < counts.height else f"all {shown}"
+    )
+    logger.info(
+        f"Label counts ({label_col}), {scope} — * = selected "
+        f"(n_classes={n_classes}, label_offset={label_offset}):"
+    )
+    for label, n_files in counts.head(top).iter_rows():
+        mark = "*" if label in selected else " "
+        logger.info(f"  {mark} {label:<38s} {n_files:>4d}")
+    if counts.height > top:
+        logger.info(f"    ... and {counts.height - top} more")
 
 
 def assign_splits(
     meta_df: pl.DataFrame,
-    n_probe_genera: int = 15,
-    min_species_per_genus: int = 2,
-    n_ssl_top: int = 3,
-    probe_all: bool = False,
-    max_files_per_species: int | None = 3,
-    max_files_per_genus: int | None = None,
+    n_classes: int = 2,
+    label_col: str = "genus",
+    val_frac: float = 0.3,
+    label_offset: int = 0,
 ) -> pl.DataFrame:
+    """Deterministic probe split over the ``n_classes`` most abundant labels.
+
+    Takes the ``n_classes`` labels with the most mzML files (ties broken
+    alphabetically) and splits **each label's own files** into probe train/val in
+    ``val_frac`` proportion. Files of every other label are marked ``"unused"`` and
+    read by nothing.
+
+    ``label_col`` is ``"genus"`` (the default) or ``"organism"`` for species.
+    ``genus == "food"`` is always excluded: it is a sample type, not an organism.
+
+    ``label_offset`` skips that many labels from the top before selecting, so
+    ``label_offset=1, n_classes=2`` probes the second- and third-largest labels.
+    The default 0 is the plain top-N. Use it when the largest label dwarfs the
+    rest and ``majority_acc`` is uncomfortably high — at the cost of fewer files,
+    so a coarser ``val_acc``. The selection is recorded in the results CSV's
+    ``class_names``, so the offset itself needs no column.
+
+    What this deliberately does NOT do
+    ----------------------------------
+    Nothing is reserved for SSL pretraining — that runs on PRIDE, and abele is
+    purely a downstream evaluation set. There is no ``"train"`` split.
+
+    Classes are not balanced or capped. On abele the two largest genera are
+    Pseudomonas (312 files) and Staphylococcus (136), so ``majority_acc`` is ~0.70
+    rather than ``random_acc``'s 0.50 — read ``val_acc_macro`` and
+    ``n_pred_classes`` alongside ``val_acc``. Because the split is proportional,
+    train and val carry the same class distribution, which makes ``majority_acc``
+    a well-behaved collapse threshold.
+
+    Train and val share species by construction, so this measures "same species,
+    unseen run", not cross-species generalisation. That is the intent — it is a
+    lower-variance sanity check on whether the encoder carries organism
+    information at all — but it is why these numbers are not comparable with those
+    from the older species-alternating split.
+
+    Returns ``meta_df`` plus ``split`` (``"probe_train"`` / ``"probe_val"`` /
+    ``"unused"``) and ``label_class`` (``0..n_classes-1`` for selected labels,
+    ``-1`` otherwise). Fully deterministic: no randomness anywhere.
     """
-    Deterministic split of files into SSL train and probe (train/val).
+    eligible = meta_df.filter(pl.col("genus") != "food")
 
-    With ``probe_all=True`` the probe covers ALL eligible genera (nothing is
-    reserved for SSL); ``n_probe_genera`` and ``n_ssl_top`` are then ignored. Use
-    this when the encoder is pretrained elsewhere (e.g. on PRIDE), so there is no
-    need to hold abele genera out for co-trained SSL.
-
-    Eligible genera (≥ min_species, not "food") are sorted by size (desc).
-    - The top n_ssl_top largest → always SSL  (e.g. Pseudomonas, Staphylococcus, Bacillus)
-    - The next n_probe_genera → probe (mid-sized, good for classification)
-    - Everything else (remaining eligible + ineligible + "food") → SSL
-    - Species within probe genera are sorted alphabetically and alternated
-      between train (even index) and val (odd index).
-    - genus_class is assigned 0..n-1 for probe genera (alphabetical by genus).
-    - SSL files get genus_class = -1.
-
-    Probe class balance
-    -------------------
-    The species alternation above implicitly assumes species carry comparable
-    numbers of files. In abele they do not: 80 of the 87 probe species have 3
-    files, but *Escherichia coli* has 48 — and being alphabetically first it always
-    lands in probe_train. Uncapped, that single species is 25% of probe_train but
-    only 2.3% of probe_val, so a probe that collapses onto it scores *below* the
-    random rate. ``max_files_per_species`` (default 3, the modal count) caps each
-    species within each probe split, which drops the train-vs-val total variation
-    from 0.232 to 0.082. ``max_files_per_genus`` additionally caps each class, for
-    an exactly balanced probe at the cost of roughly half the files. Set either to
-    ``None`` or ``0`` to disable. Capping applies to the probe splits ONLY — the
-    SSL split keeps every file. Files dropped by a cap get ``split = "unused"``
-    (never ``"train"``, which would leak probe genera into the SSL corpus).
-
-    The split is fully deterministic (no randomness). Ties in genus file count
-    are broken alphabetically by genus name.
-    """
-    # --- count species & files per genus ---
-    genus_stats = (
-        meta_df.group_by("genus")
-        .agg(
-            pl.col("organism").n_unique().alias("n_species"),
-            pl.len().alias("n_files"),
-        )
-        .sort(["n_files", "genus"], descending=[True, False])
+    counts = (
+        eligible.group_by(label_col)
+        .agg(pl.len().alias("n_files"))
+        .sort(["n_files", label_col], descending=[True, False])
     )
-
-    # --- eligible = ≥ min_species AND not "food" ---
-    eligible = genus_stats.filter(
-        (pl.col("n_species") >= min_species_per_genus) & (pl.col("genus") != "food")
-    )
-    n_eligible = len(eligible)
-
-    if probe_all:
-        # Probe on every eligible genus; reserve nothing for SSL.
-        ssl_top = set()
-        probe_genera = eligible["genus"].to_list()
-        ssl_remaining = set()
-        n_probe_genera = len(probe_genera)
-        if n_probe_genera == 0:
-            raise ValueError(f"No eligible genera to probe ({n_eligible} eligible).")
-    else:
-        # Clamp n_ssl_top and n_probe_genera to available eligible genera
-        n_ssl_top = min(n_ssl_top, n_eligible)
-        n_probe_genera = min(n_probe_genera, n_eligible - n_ssl_top)
-        if n_probe_genera <= 0:
-            raise ValueError(
-                f"No genera left for probe: {n_eligible} eligible, {n_ssl_top} reserved for SSL top."
-            )
-
-        # Top n_ssl_top → SSL, next n_probe_genera → probe, rest → SSL
-        ssl_top = set(eligible.head(n_ssl_top)["genus"].to_list())
-        probe_genera = eligible.slice(n_ssl_top, n_probe_genera)["genus"].to_list()
-        ssl_remaining = set(eligible.slice(n_ssl_top + n_probe_genera)["genus"].to_list())
-
-    # Ineligible genera (< min_species, or "food") → always SSL
-    ineligible = genus_stats.filter(
-        (pl.col("n_species") < min_species_per_genus) | (pl.col("genus") == "food")
-    )
-    ssl_genera_ineligible = set(ineligible["genus"].to_list())
-
-    all_ssl_genera = ssl_top | ssl_remaining | ssl_genera_ineligible
-
-    # --- assign genus_class (0..n-1 for probe, alphabetical by genus name) ---
-    probe_genera_sorted = sorted(probe_genera)
-    genus_to_class = {g: i for i, g in enumerate(probe_genera_sorted)}
-
-    # --- assign splits at the species level within probe genera ---
-    # For each probe genus, sort species alphabetically and alternate train/val
-    species_to_split = {}
-    probe_genus_summary = []
-
-    for genus in probe_genera_sorted:
-        genus_df = meta_df.filter(pl.col("genus") == genus)
-        species_list = sorted(genus_df["organism"].unique().to_list())
-        n_train, n_val = 0, 0
-        for idx, species in enumerate(species_list):
-            if idx % 2 == 0:
-                species_to_split[species] = "probe_train"
-                n_train += 1
-            else:
-                species_to_split[species] = "probe_val"
-                n_val += 1
-        probe_genus_summary.append(
-            (genus, len(genus_df), len(species_list), n_train, n_val)
+    if counts.height < label_offset + n_classes:
+        raise ValueError(
+            f"Only {counts.height} {label_col} values available, need "
+            f"{label_offset + n_classes} (n_classes={n_classes} at "
+            f"label_offset={label_offset}): {sorted(counts[label_col].to_list())}"
         )
 
-    # --- build split + genus_class columns ---
-    def _get_split(row):
-        genus = row["genus"]
-        organism = row["organism"]
-        if genus in all_ssl_genera:
-            return "train"
-        return species_to_split.get(organism, "train")
+    # Alphabetical class indices, so they do not shift when file counts do.
+    selected = sorted(counts.slice(label_offset, n_classes)[label_col].to_list())
+    _log_label_counts(counts, selected, label_col, n_classes, label_offset)
+    label_to_class = {label: i for i, label in enumerate(selected)}
 
-    def _get_genus_class(genus):
-        return genus_to_class.get(genus, -1)
+    # --- proportional train/val split inside each selected label ---
+    val_files: set[str] = set()
+    for label in selected:
+        files = sorted(
+            eligible.filter(pl.col(label_col) == label)["peak_file"].to_list()
+        )
+        n = len(files)
+        if n < 2:
+            # A one-file class cannot have both sides; leave it in train so the
+            # probe at least sees the class. (Falling through with k=0 would put it
+            # in val instead — stride(n, 0) means "no cap", i.e. every index.)
+            continue
+        # Clamped so a small class still yields at least one file on each side.
+        k = min(max(1, round(n * val_frac)), n - 1)
+        # stride(), not a prefix: val samples across the acquisition order instead
+        # of taking whichever contiguous batch happens to sort first.
+        val_files.update(files[i] for i in stride(n, k))
 
     meta_df = meta_df.with_columns(
-        pl.struct(["genus", "organism"])
-        .map_elements(_get_split, return_dtype=pl.Utf8)
+        pl.col(label_col)
+        .replace_strict(label_to_class, default=-1, return_dtype=pl.Int64)
+        .alias("label_class")
+    )
+    meta_df = meta_df.with_columns(
+        pl.when(pl.col("label_class") < 0)
+        .then(pl.lit("unused"))
+        .when(pl.col("peak_file").is_in(list(val_files)))
+        .then(pl.lit("probe_val"))
+        .otherwise(pl.lit("probe_train"))
         .alias("split")
     )
-    meta_df = meta_df.with_columns(
-        pl.col("genus")
-        .map_elements(_get_genus_class, return_dtype=pl.Int64)
-        .alias("genus_class")
-    )
 
-    # --- cap files per species / per genus within the probe splits ---
-    n_probe_before = meta_df.filter(
-        pl.col("split").is_in(["probe_train", "probe_val"])
-    ).height
-    if max_files_per_species:
-        meta_df = _cap_probe_files(meta_df, ["split", "organism"], max_files_per_species)
-    if max_files_per_genus:
-        meta_df = _cap_probe_files(meta_df, ["split", "genus"], max_files_per_genus)
-
-    # --- log summary ---
-    ssl_df = meta_df.filter(pl.col("split") == "train")
-    ssl_genus_counts = (
-        ssl_df.group_by("genus").agg(pl.len().alias("n")).sort("n", descending=True)
-    )
-    top_ssl = ssl_genus_counts.head(5)["genus"].to_list()
+    n_train = meta_df.filter(pl.col("split") == "probe_train").height
+    n_val = meta_df.filter(pl.col("split") == "probe_val").height
     logger.info(
-        f"SSL: {ssl_genus_counts.shape[0]} genera, {ssl_df.shape[0]} files "
-        f"(top: {', '.join(top_ssl)}, ...)"
+        f"Probe: {n_classes} {label_col} classes (label_offset={label_offset}), "
+        f"{n_train + n_val} files ({n_train} train / {n_val} val); "
+        f"{meta_df.filter(pl.col('split') == 'unused').height} files unused"
     )
-
-    # Per-genus file counts AFTER capping, so the log reflects what the probe sees.
-    n_train_files = _split_counts(meta_df, "probe_train")
-    n_val_files = _split_counts(meta_df, "probe_val")
-    n_probe_files = sum(n_train_files.values()) + sum(n_val_files.values())
-    n_dropped = n_probe_before - n_probe_files
-    logger.info(
-        f"Probe: {n_probe_genera} genera, {n_probe_files} files "
-        f"({sum(n_train_files.values())} train / {sum(n_val_files.values())} val)"
-    )
-    for genus, _n_files, n_sp, n_train, n_val in probe_genus_summary:
-        cls = genus_to_class[genus]
-        logger.info(
-            f"  [{cls}] {genus:<25s} ({n_sp:>2d} sp: {n_train} train / {n_val} val) "
-            f"— files: {n_train_files.get(genus, 0):>3d} train / "
-            f"{n_val_files.get(genus, 0):>3d} val"
+    for label in selected:
+        cls = label_to_class[label]
+        _log_class_composition(
+            meta_df.filter(pl.col(label_col) == label), label, cls
         )
-    if n_dropped:
-        logger.info(
-            f"Capped {n_dropped}/{n_probe_before} probe files to 'unused' "
-            f"(max_files_per_species={max_files_per_species}, "
-            f"max_files_per_genus={max_files_per_genus}) to keep the probe "
-            f"train/val class distributions comparable."
-        )
+        n_cls_val = meta_df.filter(
+            (pl.col(label_col) == label) & (pl.col("split") == "probe_val")
+        ).height
+        if n_cls_val < 3:
+            logger.warning(
+                f"Class [{cls}] {label} has only {n_cls_val} val file(s); val "
+                f"accuracy is coarsely quantised at that size."
+            )
 
     return meta_df
 
@@ -385,65 +336,6 @@ def load_mzml_data(
     return dfs
 
 
-def get_needed_files(
-    meta_df: pl.DataFrame, data_dir: str, n_ssl_files: int | None = None
-) -> list[str]:
-    """
-    Return only the peak_files that will actually be used, so only these
-    need to be loaded from disk.
-
-    1. Checks which metadata files exist in data_dir (logs missing ones).
-    2. Selects all existing probe files (always needed).
-    3. Selects existing SSL train files, capped to n_ssl_files if set
-       (deterministic: sorted alphabetically).
-    4. Returns the union.
-    """
-    all_files = meta_df["peak_file"].to_list()
-    existing = set()
-    missing = []
-    for f in all_files:
-        if os.path.exists(os.path.join(data_dir, f)):
-            existing.add(f)
-        else:
-            missing.append(f)
-
-    if missing:
-        logger.warning(
-            f"{len(missing)}/{len(all_files)} mzML files not found in {data_dir}:"
-        )
-        for f in missing:
-            logger.warning(f"  missing: {f}")
-
-    # Probe files — always needed (skip missing)
-    probe_files = [
-        f
-        for f in meta_df.filter(pl.col("split").is_in(["probe_train", "probe_val"]))[
-            "peak_file"
-        ].to_list()
-        if f in existing
-    ]
-
-    # SSL train files — cap after filtering to existing
-    ssl_files = [
-        f
-        for f in meta_df.filter(pl.col("split") == "train")["peak_file"].to_list()
-        if f in existing
-    ]
-    if n_ssl_files is not None and len(ssl_files) > n_ssl_files:
-        ssl_files = sorted(ssl_files)[:n_ssl_files]
-        logger.info(
-            f"SSL train capped to {n_ssl_files} files "
-            f"(of {len(meta_df.filter(pl.col('split') == 'train'))} in metadata)"
-        )
-
-    needed = sorted(set(probe_files) | set(ssl_files))
-    logger.info(
-        f"Files to load: {len(needed)} "
-        f"({len(ssl_files)} SSL train + {len(probe_files)} probe)"
-    )
-    return needed
-
-
 def run_collate_fn(rows):
     """Collate function for RunDataset: keeps mz/intensity as lists of tensors."""
     keys = rows[0].keys()
@@ -477,7 +369,7 @@ def build_probe_dataloaders(dfs: dict, meta_df: pl.DataFrame, config):
     loaded_files = list(dfs.keys())
     meta_df = meta_df.filter(pl.col("peak_file").is_in(loaded_files))
 
-    run_labels = dict(zip(meta_df["peak_file"], meta_df["genus_class"]))
+    run_labels = dict(zip(meta_df["peak_file"], meta_df["label_class"]))
 
     def _make_probe_dataset(split_name):
         files = meta_df.filter(pl.col("split") == split_name)["peak_file"].to_list()
@@ -506,58 +398,3 @@ def build_probe_dataloaders(dfs: dict, meta_df: pl.DataFrame, config):
     )
 
     return probe_train_loader, probe_val_loader
-
-
-def build_dataloaders(dfs: dict, meta_df: pl.DataFrame, config):
-    """
-    Build all four DataLoaders for an eval experiment.
-
-    Filters meta_df to only files present in dfs. File selection and SSL
-    capping should be done upstream via get_needed_files().
-
-    Returns:
-        train_loader       – SSL pretraining (spectra-level, shuffled)
-        val_loader         – SSL validation (spectra-level, not shuffled)
-        probe_train_loader – run-level probe training (shuffled)
-        probe_val_loader   – run-level probe evaluation
-    """
-    batch_size = config.data.batch_size
-    seq_len = config.data.max_num_peaks
-
-    # filter to files that were actually loaded
-    loaded_files = list(dfs.keys())
-    meta_df = meta_df.filter(pl.col("peak_file").is_in(loaded_files))
-
-    # --- SSL datasets (spectrum-level, stored in Lance) ---
-    def _make_ssl_dataset(split_names):
-        files = meta_df.filter(pl.col("split").is_in(split_names))[
-            "peak_file"
-        ].to_list()
-        df = pl.concat([dfs[f] for f in files], how="vertical")
-        df = df.join(meta_df, on="peak_file", how="left")
-        stream = SpectrumDataset(
-            df.select(["mz_array", "intensity_array", "genus_class"]),
-            batch_size=256,
-        )
-        dataset = LanceMapDataset(str(stream.path), seq_len=seq_len)
-        # Prevent the SpectrumDataset (and its temp Lance DB) from being
-        # garbage-collected while the LanceMapDataset still needs the files.
-        dataset._spectrum_dataset_ref = stream
-        return dataset
-
-    train_dataset = _make_ssl_dataset(["train"])
-    val_dataset = _make_ssl_dataset(["probe_train", "probe_val"])
-
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, num_workers=0, shuffle=True
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, num_workers=0, shuffle=False
-    )
-
-    # --- Probe datasets (run-level) ---
-    probe_train_loader, probe_val_loader = build_probe_dataloaders(
-        dfs, meta_df, config
-    )
-
-    return train_loader, val_loader, probe_train_loader, probe_val_loader

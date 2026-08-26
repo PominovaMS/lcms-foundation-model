@@ -103,8 +103,7 @@ def should_smooth(
     the whole validation set, so there is no batch-to-batch noise to remove and an EMA
     would only add lag. That is decided by kind, not by point count — val is per-epoch
     however many epochs a run happens to have. The ``lr`` panel is excluded too, being
-    deterministic. ``min_points`` then keeps the remaining short per-epoch series (the
-    ``retrain_*`` / ``online_*`` probe metrics) raw.
+    deterministic. ``min_points`` then keeps any remaining short per-epoch series raw.
     """
     if panel_name not in SMOOTHED_PANELS or weight <= 0:
         return False
@@ -166,9 +165,9 @@ def main():
         "--smooth-min-points",
         type=int,
         default=50,
-        help="Only smooth series with at least this many points, which keeps the "
-        "short per-epoch curves (the retrain_*/online_* probe metrics) raw. Val "
-        "curves are never smoothed regardless of this setting.",
+        help="Only smooth series with at least this many points, which keeps short "
+        "per-epoch curves raw. Val curves are never smoothed regardless of this "
+        "setting.",
     )
     args = parser.parse_args()
     if not 0 <= args.smooth < 1:

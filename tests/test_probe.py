@@ -93,6 +93,29 @@ def _fake_run_loader(n_runs, n_spectra=2, n_peaks=5):
     ]
 
 
+def test_chunking_is_exact():
+    """Chunked encoding must match a single whole-run forward.
+
+    This is what makes the OOM fix safe: spectra are independent items on the
+    batch dimension, so a chunk boundary cannot change a per-spectrum embedding.
+    allclose, not ==, because the final mean sums in a different order.
+    """
+    from probe import encode_dataset
+
+    model = MS1Encoder(d_model=D_MODEL, nhead=1, dim_feedforward=12, n_layers=1)
+    model.eval()
+    loader = _fake_run_loader(4, n_spectra=7)
+
+    whole, y = encode_dataset(model, loader, "label", "cpu", chunk_size=99)
+    uneven, _ = encode_dataset(model, loader, "label", "cpu", chunk_size=3)
+    one_at_a_time, _ = encode_dataset(model, loader, "label", "cpu", chunk_size=1)
+
+    assert whole.shape == (4, D_MODEL)
+    assert torch.allclose(whole, uneven, atol=1e-5)
+    assert torch.allclose(whole, one_at_a_time, atol=1e-5)
+    assert torch.equal(y, torch.arange(4) % NUM_CLASSES)
+
+
 def test_run_retrain_probe_aggregates_repeats():
     """End-to-end: encode once, fit n_repeats probes, report mean + std."""
     model = MS1Encoder(d_model=D_MODEL, nhead=1, dim_feedforward=12, n_layers=1)

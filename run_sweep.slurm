@@ -52,6 +52,13 @@ MZML_CACHE="${MZML_CACHE-/mnt/data/cadams/cache/abele_mzml}"
 ACCESSIONS=(PXD004452 PXD012636 PXD009737 PXD030983 PXD013868)
 MAX_EPOCHS=25     # smoke test; raise for the real run
 LIMIT=50        # files per accession. Empty ("") = use all.
+# Keep a weights-only checkpoint every N epochs under checkpoints/epochs/, so probe
+# accuracy can be plotted against pretraining epoch afterwards:
+#     sbatch --array=0-9 --export=ALL,RUN=<run>,CKPT_GLOB=1 run_probe.slurm
+#     python scripts/plot_sweep.py --results_csv results/probe/<run>.csv --x ssl_epoch
+# Empty ("") = off, and the run keeps only best-val_loss + last.ckpt as before. Costs
+# ~310 MB per file at d_model=1024/L9/ff2048, so pick N for MAX_EPOCHS/N files.
+SAVE_EVERY_N_EPOCHS=1
 
 # Names the DATA (accessions + LIMIT), and nothing else. It goes into the stage dir and
 # the Lance dir, so each data variant gets its own paths and they coexist instead of
@@ -63,7 +70,6 @@ LIMIT=50        # files per accession. Empty ("") = use all.
 # is gone. Hyperparameters do NOT belong here; they go in RUN_TAG. Keep it echoed in
 # RUN_TAG too, so the run name says which data the checkpoint was trained on.
 DATA_TAG=5x50
-PROBE_ALL=      # empty = probe 15 mid-sized genera. Set to 1 to probe ALL genera (slower).
 
 # --- probe split + probe reproducibility -----------------------------------
 # These define the EVAL, not the model. Every run you intend to compare must use
@@ -71,10 +77,9 @@ PROBE_ALL=      # empty = probe 15 mid-sized genera. Set to 1 to probe ALL gener
 # defaults so a default change can never silently make new rows incomparable with
 # old ones. All of them are recorded in the results CSV, so each row is
 # self-describing.
-N_PROBE_GENERA=15
-N_SSL_TOP=3
-MAX_FILES_PER_SPECIES=3   # caps E. coli's 48 files (0 = no cap, the old skewed split)
-MAX_FILES_PER_GENUS=0     # 0 = off; set to balance classes exactly (~half the files)
+PROBE_LABEL=genus         # genus | species
+N_CLASSES=2               # the N most abundant labels by file count
+VAL_FRAC=0.3              # held out per class; train/val share species
 PROBE_SEED=0
 PROBE_REPEATS=3           # accuracy is the mean over this many seeded probe fits;
                           # the reported std is the noise floor for comparing runs
@@ -156,7 +161,8 @@ rm -rf "$STAGE_DIR"
 ( cd source && "$ENV/bin/python" train.py \
     --lance_dir "$LANCE_DIR" --config ../config.yaml \
     --run_name "$RUN" --max_epochs "$MAX_EPOCHS" --seed "$TRAIN_SEED" \
-    ${LR:+--lr "$LR"} ${WARMUP_ITERS:+--warmup_iters "$WARMUP_ITERS"} )
+    ${LR:+--lr "$LR"} ${WARMUP_ITERS:+--warmup_iters "$WARMUP_ITERS"} \
+    ${SAVE_EVERY_N_EPOCHS:+--save_every_n_epochs "$SAVE_EVERY_N_EPOCHS"} )
 
 # 4) Probe the checkpoint on abele -> one row in results/<run>.csv.
 #    Results stay in a PER-RUN file: this script reads SLURM_ARRAY_TASK_ID, so it
@@ -168,13 +174,11 @@ mkdir -p "$REPO/results"
 "$ENV/bin/python" eval/probe_checkpoint.py \
     --ckpt_path "$CKPT" --data_dir "$ABELE_MZML" --meta_path "$ABELE_META" \
     --config config.yaml --run_name "$RUN" \
-    --n_probe_genera "$N_PROBE_GENERA" --n_ssl_top "$N_SSL_TOP" \
-    --max_files_per_species "$MAX_FILES_PER_SPECIES" \
-    --max_files_per_genus "$MAX_FILES_PER_GENUS" \
+    --probe_label "$PROBE_LABEL" --n_classes "$N_CLASSES" \
+    --val_frac "$VAL_FRAC" \
     --probe_seed "$PROBE_SEED" --probe_repeats "$PROBE_REPEATS" \
     --results_csv "$REPO/results/$RUN.csv" \
-    ${MZML_CACHE:+--mzml_cache_dir "$MZML_CACHE"} \
-    ${PROBE_ALL:+--probe_all}
+    ${MZML_CACHE:+--mzml_cache_dir "$MZML_CACHE"}
 
-# 21 columns on one line is unreadable in a slurm log; tabulate if `column` exists.
+# 22 columns on one line is unreadable in a slurm log; tabulate if `column` exists.
 column -s, -t < "$REPO/results/$RUN.csv" || cat "$REPO/results/$RUN.csv"

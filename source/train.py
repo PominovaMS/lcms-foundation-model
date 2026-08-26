@@ -102,6 +102,15 @@ parser.add_argument(
     help="Read the training data in stored order instead of re-drawing batches each "
     "epoch. Reproduces pre-shuffle runs.",
 )
+parser.add_argument(
+    "--save_every_n_epochs",
+    type=int,
+    default=0,
+    help="Also keep a weights-only checkpoint every N epochs, under "
+    "checkpoints/epochs/, so the encoder can be probed as a function of "
+    "pretraining epoch. 0 (default) = off; only best-val_loss and last.ckpt are "
+    "kept, which is what every earlier run has.",
+)
 args = parser.parse_args()
 
 # Seed before anything stochastic: the batch shuffle, the peak masking, and the model
@@ -305,6 +314,33 @@ checkpoint_callback = L.callbacks.ModelCheckpoint(
     save_last=True,
     filename="{epoch}-{step}-{val_loss:.4f}",
 )
+callbacks = [checkpoint_callback]
+
+# --save_every_n_epochs: keep an unpruned series of checkpoints so probe_checkpoint.py
+# can be pointed at each one and produce probe accuracy as a function of pretraining
+# epoch. The callback above cannot do this — it keeps only the single best val_loss.
+#
+# Its own subdirectory, so these files can never be confused with (or take the name of)
+# the `last.ckpt` path the slurm scripts hardcode. save_top_k=-1 is required: with
+# every_n_epochs alone, the default save_top_k=1 overwrites each file with the next.
+#
+# save_weights_only drops the two Adam moments, cutting ~925 MB to ~310 MB per file at
+# d_model=1024 / n_layers=9 / ff=2048. load_from_checkpoint still works (hyper_parameters
+# is saved either way), which is all the probe needs; these files cannot be RESUMED from,
+# so last.ckpt remains the resume point.
+if args.save_every_n_epochs > 0:
+    callbacks.append(
+        L.callbacks.ModelCheckpoint(
+            dirpath=os.path.join(ckpt_dir, "epochs"),
+            every_n_epochs=args.save_every_n_epochs,
+            save_top_k=-1,
+            save_weights_only=True,
+            # Without auto_insert_metric_name=False Lightning expands each {name} to
+            # "name={value}", giving "epochepoch=000-stepstep=00000004.ckpt".
+            auto_insert_metric_name=False,
+            filename="epoch{epoch:03d}-step{step:08d}",
+        )
+    )
 
 # TODO: set reasonable hyperparameters and move them to constants/config
 model = MS1Encoder(
@@ -329,7 +365,7 @@ trainer = L.Trainer(
     #     resume_from_checkpoint=ckpt_path,
     logger=logger,
     default_root_dir=root_dir,
-    callbacks=[checkpoint_callback],
+    callbacks=callbacks,
     accelerator=config.training.accelerator,
     devices=config.training.devices,
     precision=PRECISION,

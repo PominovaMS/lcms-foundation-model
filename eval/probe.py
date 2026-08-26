@@ -1,13 +1,12 @@
 """Standalone (trainer-free) linear probe over run-level embeddings.
 
-Lifted from ``eval/callbacks.py::FineTuner`` so a *pretrained* checkpoint can be
-evaluated without running any SSL training or a PyTorch Lightning ``Trainer``.
+Evaluates a *pretrained* checkpoint without running any SSL training or a PyTorch
+Lightning ``Trainer``.
 
 The encoder is frozen (``torch.no_grad`` in :func:`encode_run`); a fresh
 ``nn.Linear`` probe is trained on run-level embeddings until the average train
 loss drops below ``min_train_loss`` (or ``n_epochs`` is reached), then evaluated
-on the probe validation set. This mirrors the retrain-style probe reported as
-``retrain_val_acc`` during co-trained SSL evaluation.
+on the probe validation set.
 
 Two properties matter for comparing checkpoints against each other:
 
@@ -31,36 +30,61 @@ from torchmetrics.functional import accuracy
 logger = logging.getLogger(__name__)
 
 
-def encode_run(model, run_mz, run_I, device):
+def encode_run(model, run_mz, run_I, device, chunk_size: int = 512):
     """Frozen run-level embedding: mean-pool peaks, then mean-pool spectra.
 
-    Matches ``FineTuner._encode_run`` (eval/callbacks.py) so probe numbers are
-    comparable to the co-trained SSL evaluation.
+    Encodes ``chunk_size`` spectra at a time. A whole LC-MS run is thousands of
+    MS1 spectra, and pushing it through the transformer in a single forward needs
+    tens of GB: the attention term alone is ``nhead * (n_peaks+1)**2 * 4B`` per
+    spectrum (~1.3 MB at 200 peaks) and it does NOT shrink with ``d_model``.
+
+    Chunking is exact, not an approximation. ``SpectrumTransformerEncoder`` puts
+    spectra on the *batch* dimension and attends only over the peaks within a
+    spectrum, so splitting dim 0 yields identical per-spectrum embeddings; only
+    the floating-point summation order of the final mean changes. Dropout is off
+    (callers set ``model.eval()``), so chunk boundaries cannot alter the result.
     """
-    run_mz, run_I = run_mz.to(device), run_I.to(device)
+    n = run_mz.shape[0]
+    total = None
     with torch.no_grad():
-        peak_embs = model.forward(run_mz, run_I)
-        spec_embs = peak_embs.mean(dim=1)
-        spec_embs = spec_embs.unsqueeze(dim=0)  # (1, T, d)
-        run_emb = spec_embs.mean(dim=1)  # (1, d)
-    return run_emb
+        for start in range(0, n, chunk_size):
+            mz = run_mz[start : start + chunk_size].to(device)
+            I = run_I[start : start + chunk_size].to(device)
+            spec_embs = model.forward(mz, I).mean(dim=1)  # (chunk, d)
+            chunk_sum = spec_embs.sum(dim=0)  # (d,)
+            total = chunk_sum if total is None else total + chunk_sum
+    return (total / n).unsqueeze(0)  # (1, d)
 
 
-def encode_dataset(model, loader, target_key, device):
+def encode_dataset(model, loader, target_key, device, chunk_size: int = 512):
     """Encode every run in a loader ONCE to a fixed (N, d) embedding matrix.
 
     The encoder is frozen, so a run's embedding never changes — precomputing it
     once avoids re-running the transformer on every probe epoch (the previous
     behavior, which made the probe ~n_epochs times slower than necessary).
     Returns ``(embeddings, targets)`` on ``device``.
+
+    Logs the run-size distribution: how many spectra a run holds is what decides
+    whether ``chunk_size`` is sensible, and it is recorded nowhere else.
     """
-    embs, targets = [], []
+    embs, targets, sizes = [], [], []
     for batch in loader:
         runs_mz = batch["mz_array"]
         runs_I = batch["intensity_array"]
         for i in range(len(runs_mz)):
-            embs.append(encode_run(model, runs_mz[i], runs_I[i], device))
+            sizes.append(int(runs_mz[i].shape[0]))
+            embs.append(
+                encode_run(model, runs_mz[i], runs_I[i], device, chunk_size=chunk_size)
+            )
         targets.append(batch[target_key].to(device))
+
+    if sizes:
+        sizes_t = torch.tensor(sizes, dtype=torch.float)
+        logger.info(
+            f"Encoded {len(sizes)} runs, {sum(sizes):,} spectra "
+            f"(min {min(sizes)} / median {int(sizes_t.median())} / "
+            f"max {max(sizes)} per run, chunk_size={chunk_size})"
+        )
     return torch.cat(embs, dim=0), torch.cat(targets, dim=0)
 
 
@@ -167,12 +191,15 @@ def run_retrain_probe(
     device=None,
     seed: int = 0,
     n_repeats: int = 3,
+    chunk_size: int = 512,
 ) -> dict[str, float]:
     """Train fresh linear probes on the frozen encoder and evaluate them.
 
     Run embeddings are computed once up front (the encoder is frozen), then
     ``n_repeats`` probes are fit on those cached vectors with seeds
-    ``seed, seed+1, ...``. Returns a flat dict of ``<metric>`` (mean) and
+    ``seed, seed+1, ...``. ``chunk_size`` bounds encoder memory (see
+    :func:`encode_run`) and cannot change the numbers, only whether they compute.
+    Returns a flat dict of ``<metric>`` (mean) and
     ``<metric>_std`` across repeats, plus the seed-independent baselines from
     :func:`baseline_metrics`.
     """
@@ -180,8 +207,12 @@ def run_retrain_probe(
     model.eval()
 
     # --- encode all runs once (the expensive part, done a single time) ---
-    X_train, y_train = encode_dataset(model, probe_train_loader, target_key, device)
-    X_val, y_val = encode_dataset(model, probe_val_loader, target_key, device)
+    X_train, y_train = encode_dataset(
+        model, probe_train_loader, target_key, device, chunk_size=chunk_size
+    )
+    X_val, y_val = encode_dataset(
+        model, probe_val_loader, target_key, device, chunk_size=chunk_size
+    )
 
     runs = [
         fit_probe(
@@ -215,7 +246,7 @@ def run_retrain_probe(
         logger.warning(
             f"COLLAPSE: macro accuracy {results['val_acc_macro']:.4f} does not beat "
             f"the random rate {results['random_acc']:.4f} — the representation "
-            f"carries no usable genus signal."
+            f"carries no usable organism signal."
         )
     if results["probe_epochs"] >= n_epochs:
         logger.warning(
