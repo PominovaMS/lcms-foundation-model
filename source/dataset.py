@@ -1,8 +1,11 @@
+import os
 import numpy as np
+import pyarrow as pa
 import lance
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
+from depthcharge.data import SpectrumDataset, spectra_to_df, preprocessing, CustomField
 from tqdm import tqdm
 
 
@@ -105,3 +108,84 @@ class RunDataset(Dataset):
             pad_right = self.seq_len - len(sequence)
             return np.pad(sequence, (0, pad_right))
         return sequence
+
+
+def build_dataset(
+    mzml_files, 
+    data_config, 
+    lance_path, 
+    force_rebuild: bool = False,
+) -> LanceMapDataset:
+    """Build a Lance-backed dataset from a collection of mzML files.
+
+    MS1 spectra are read from each mzML file, preprocessed, and added to a
+    Lance-backed ``SpectrumDataset``. The resulting dataset is wrapped in
+    ``LanceMapDataset`` to provide map-style access and support PyTorch
+    DataLoader shuffling.
+
+    Parameters
+    ----------
+    mzml_files : list[str]
+        Paths to the mzML files to include in the dataset.
+    data_config : DataConfig
+        Data configuration containing preprocessing parameters, including
+        ``max_num_peaks``.
+    lance_path : str
+        Path at which to create the Lance dataset.
+    force_rebuild : bool, optional
+        If True, rebuild the Lance dataset even if it already exists at
+        ``lance_path``. Default is False.
+
+    Returns
+    -------
+    LanceMapDataset
+        Map-style wrapper around the created Lance dataset.
+    """
+
+    if os.path.exists(lance_path) and not force_rebuild:
+        print(f"Reusing existing Lance dataset at: {lance_path}")
+        return LanceMapDataset(
+            lance_path,
+            seq_len=data_config.max_num_peaks,
+        )
+        
+    # Spectrum preprocessing transforms
+    preprocessing_fn = [
+        preprocessing.filter_intensity(max_num_peaks=data_config.max_num_peaks),
+        preprocessing.scale_intensity(scaling="root", max_intensity=1.0),
+    ]
+    
+    # Custom field for extracting Retention time
+    rt_field = CustomField(
+        # The new column name:
+        name="ret_time",
+        # The function to extract the retention time:
+        accessor=lambda x: x["scanList"]["scan"][0]["scan start time"],
+        # The expected data type:
+        dtype=pa.float64(),
+    )
+
+    # Batch size for SpectrumDataset class. Doesn't impact training batch size
+    lance_batch_size = 256
+
+    lance_dataset = None
+    for mzml_file in mzml_files:
+        df = spectra_to_df(
+            mzml_file,
+            metadata_df=None,
+            ms_level=1,
+            preprocessing_fn=preprocessing_fn,
+            valid_charge=None,
+            custom_fields=rt_field,
+            progress=True,
+        )
+        if lance_dataset is None:
+            lance_dataset = SpectrumDataset(df, path=lance_path, batch_size=lance_batch_size)
+        else:
+            lance_dataset.add_spectra(df)
+        del df
+    print("Created Lance dataset at:", lance_path)
+        
+    # Add LanceMapDataset wrapper for shuffle support
+    dataset = LanceMapDataset(lance_path, seq_len=data_config.max_num_peaks)
+    return dataset
