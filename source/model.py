@@ -5,7 +5,6 @@ import torchmetrics
 import pytorch_lightning as L
 from depthcharge.encoders import PeakEncoder, PositionalEncoder
 from depthcharge.transformers import SpectrumTransformerEncoder
-from .scheduler import CosineWarmupScheduler
 
 
 class MS1Encoder(L.LightningModule):
@@ -22,8 +21,10 @@ class MS1Encoder(L.LightningModule):
         masked_peaks_fraction=0.3,
         mask_proportional=True,
         lr=5e-4,
-        warmup_iters=1000,
-        cosine_schedule_period_iters=32000,
+        total_steps=32000,
+        warmup_steps=1000,
+        div_factor=25.0,
+        final_div_factor=1e4,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -216,17 +217,19 @@ class MS1Encoder(L.LightningModule):
         )
         return loss
 
-    def configure_optimizers(
-        self,
-    ):
-        """TODO."""
+    def configure_optimizers(self):
         optimizer = torch.optim.Adam(
             self.parameters(), lr=self.hparams.lr, betas=(0.9, 0.98)
         )
-        self.lr_scheduler = CosineWarmupScheduler(
+        self.lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            self.hparams.warmup_iters,
-            self.hparams.cosine_schedule_period_iters,
+            max_lr=self.hparams.lr,
+            total_steps=self.hparams.total_steps,
+            pct_start=self.hparams.warmup_steps / self.hparams.total_steps,
+            anneal_strategy="cos",
+            div_factor=self.hparams.div_factor,
+            final_div_factor=self.hparams.final_div_factor,
+            cycle_momentum=False,
         )
         return {
             "optimizer": optimizer,
@@ -234,7 +237,7 @@ class MS1Encoder(L.LightningModule):
                 "scheduler": self.lr_scheduler,
                 "interval": "step",
                 "frequency": 1,
-                "name": "cosine_warmup",
+                "name": "one_cycle",
             },
         }
 

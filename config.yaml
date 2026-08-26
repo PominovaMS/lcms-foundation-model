@@ -1,12 +1,11 @@
 # Experiment configuration
-name: "ms1-mz-200_peaks-sqrt-clf_run_retrain" # ms1 # retrain finetuning
-# name: "ms1-mz-200_peaks-sqrt-clf_run" # ms1 # online finetuning
+name: "MS1-mz-200_peaks-pride_500"
 
 # Data configuration
 data:
-  train_dir: "train_mzml"
-  val_dir: "val_mzml"
-  batch_size: 1000 # 2000
+  train_dir: "train_mzml" # FIXME: not used properly. Fix or remove.
+  val_dir: "val_mzml" # FIXME: not used properly. Fix or remove.
+  batch_size: 1000
   max_num_peaks: 200
 
 # Model configuration
@@ -23,14 +22,16 @@ model:
   
 # Optimizer settings
 optimizer:
-  lr: 0.0005 # 0.0003
-  warmup_iters: 1000
-  cosine_schedule_period_iters: 64000 # 32000
+  lr: 0.0005       # peak LR of the one-cycle schedule
+  warmup_steps: 1000
+  total_steps: 64000  
+  div_factor: 25.0          # initial LR = lr / div_factor
+  final_div_factor: 10000.0 # final LR = initial_lr / final_div_factor
 
 # Training settings
 training:
   checkpoint_path: "./train_checkpoints"
-  max_epochs: 1000 # 200
+  max_epochs: 100
   gradient_clip_val: 5
   accelerator: "gpu"
   devices: 1

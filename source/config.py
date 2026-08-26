@@ -25,9 +25,13 @@ class ModelConfig:
 
 @dataclass
 class OptimizerConfig:
-    lr: float
-    warmup_iters: int
-    cosine_schedule_period_iters: int
+    lr: float  # peak LR of the one-cycle schedule
+    # Total optimiser steps for the one-cycle schedule.
+    total_steps: Optional[int]
+    # Steps to warm up the LR from lr/div_factor to lr. Expected to be lower than total_steps.
+    warmup_steps: int = 1000
+    div_factor: float = 25.0   # initial LR = lr / div_factor
+    final_div_factor: float = 1e4  # final LR = initial_lr / final_div_factor
 
 
 @dataclass
