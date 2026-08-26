@@ -110,6 +110,23 @@ class RunDataset(Dataset):
         return sequence
 
 
+# FIXME: check that this collate function corresponds to the one used in the notebooks (and thus is correct)
+def run_collate_fn(rows: list[dict]) -> dict:
+    """Collate function for RunDataset.
+
+    Keeps mz_array and intensity_array as lists of per-run tensors
+    (runs can have different lengths), and stacks scalar fields.
+    """
+    keys = rows[0].keys()
+    batch = {}
+    for key in keys:
+        if key in ("mz_array", "intensity_array"):
+            batch[key] = [torch.tensor(r[key]) for r in rows]
+        else:
+            batch[key] = torch.tensor([r[key] for r in rows])
+    return batch
+
+
 def build_dataset(
     mzml_files, 
     data_config, 
